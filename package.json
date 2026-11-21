@@ -1,0 +1,30 @@
+{
+  "name": "workercraft",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "repository": "github:joaobnobre/workercraft",
+  "type": "module",
+  "description": "A Minecraft server with no server: the protocol runs in a Cloudflare Worker, each world is a Durable Object, plugins are Workers.",
+  "scripts": {
+    "dev": "wrangler dev -c wrangler.jsonc -c plugins/guard/wrangler.jsonc -c plugins/welcome/wrangler.jsonc -c plugins/builder/wrangler.jsonc",
+    "dev:26.1": "wrangler dev --tsconfig tsconfig.26.1.json -c wrangler.jsonc -c plugins/guard/wrangler.jsonc -c plugins/welcome/wrangler.jsonc -c plugins/builder/wrangler.jsonc",
+    "deploy": "for p in guard welcome builder; do wrangler deploy -c plugins/$p/wrangler.jsonc || exit 1; done && wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "typecheck:26.1": "tsc --noEmit -p tsconfig.26.1.json",
+    "gen": "node scripts/gen-data.mjs",
+    "test": "node test/conformance.mjs",
+    "test:bots": "node test/e2e.mjs"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261121.1",
+    "minecraft-protocol": "^1.68.0",
+    "mineflayer": "^4.39.0",
+    "typescript": "^5.9.0",
+    "wrangler": "^4.166.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true,
+    "workerd@1.20261119.1": true
+  }
+}

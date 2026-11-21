@@ -1,0 +1,7 @@
+node_modules
+.wrangler
+.cache
+.dev.vars
+# Version data extracted from Mojang's server jar. Recreate it with `npm run gen`.
+src/generated/
+*.tmp

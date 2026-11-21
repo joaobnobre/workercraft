@@ -1,0 +1,9 @@
+// Builds the server for Minecraft 26.1.x instead of the current version:
+//   wrangler dev --tsconfig tsconfig.26.1.json ...
+// The bot suite needs this, because its client library stops at 26.1.
+{
+	"extends": "./tsconfig.json",
+	"compilerOptions": {
+		"paths": { "#version-data": ["./src/generated/v775.json"] }
+	}
+}

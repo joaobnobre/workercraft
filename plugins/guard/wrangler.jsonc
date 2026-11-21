@@ -1,0 +1,9 @@
+{
+	"$schema": "../../node_modules/wrangler/config-schema.json",
+	"name": "workercraft-plugin-guard",
+	"main": "index.ts",
+	"compatibility_date": "2026-11-08",
+	// Reached only through the world's service binding, so no public URL.
+	"workers_dev": false,
+	"preview_urls": false
+}

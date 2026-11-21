@@ -1,0 +1,29 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "workercraft",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-11-08",
+	// Raw TCP listener for `wrangler dev`. 25565 is Minecraft's default port,
+	// so the game connects to plain "localhost". In production the public port
+	// is whatever the Spectrum application exposes.
+	"connect": [{ "protocol": "tcp", "port": 25565 }],
+	"durable_objects": {
+		"bindings": [{ "name": "WORLD", "class_name": "World" }]
+	},
+	"migrations": [{ "tag": "v1", "new_sqlite_classes": ["World"] }],
+	// Plugins are Workers. Every service bound under a name starting with
+	// PLUGIN_ receives the world's events, in this order.
+	"services": [
+		{ "binding": "PLUGIN_GUARD", "service": "workercraft-plugin-guard" },
+		{ "binding": "PLUGIN_WELCOME", "service": "workercraft-plugin-welcome" },
+		{ "binding": "PLUGIN_BUILDER", "service": "workercraft-plugin-builder" }
+	],
+	"vars": {
+		"MAX_PLAYERS": "100",
+		// Chunks sent around each player, as a radius.
+		"VIEW_DISTANCE": "8",
+		// "off" stops the lookups of player skins on Mojang's API.
+		"SKINS": "on"
+	},
+	"observability": { "enabled": true }
+}
