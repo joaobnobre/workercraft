@@ -7,8 +7,8 @@
   "type": "module",
   "description": "A Minecraft server with no server: the protocol runs in a Cloudflare Worker, each world is a Durable Object, plugins are Workers.",
   "scripts": {
-    "dev": "wrangler dev -c wrangler.jsonc -c plugins/guard/wrangler.jsonc -c plugins/welcome/wrangler.jsonc -c plugins/builder/wrangler.jsonc",
-    "dev:26.1": "wrangler dev --tsconfig tsconfig.26.1.json -c wrangler.jsonc -c plugins/guard/wrangler.jsonc -c plugins/welcome/wrangler.jsonc -c plugins/builder/wrangler.jsonc",
+    "dev": "node scripts/dev.mjs",
+    "dev:26.1": "node scripts/dev.mjs --tsconfig tsconfig.26.1.json",
     "deploy": "for p in guard welcome builder; do wrangler deploy -c plugins/$p/wrangler.jsonc || exit 1; done && wrangler deploy",
     "typecheck": "tsc --noEmit",
     "typecheck:26.1": "tsc --noEmit -p tsconfig.26.1.json",
