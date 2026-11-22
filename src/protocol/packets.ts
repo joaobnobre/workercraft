@@ -3,6 +3,7 @@
 
 import { concat, packet, type Writer } from "../net/bytes";
 import { writeNbt, type Nbt, type Text } from "../net/nbt";
+import { writeStack, type Stack } from "./components";
 import { BEFORE_26_3, C, DATA_PACK_VERSIONS, DIMENSION, DIMENSION_TYPE_ID, ITEM_ENTITY_TYPE, OVERWORLD_CLOCK_ID, PLAYER_ENTITY_TYPE, data } from "./version";
 
 export interface ProfileProperty {
@@ -286,19 +287,17 @@ const LEVEL_EVENT_BLOCK_BREAK = 2001;
 export const blockBreakEffect = (x: number, y: number, z: number, state: number) =>
 	packet(C.play.levelEvent, (w) => w.i32(LEVEL_EVENT_BLOCK_BREAK).position(x, y, z).i32(state).bool(false));
 
-/** An item stack: count, then item id and "no extra data" unless the stack is empty. */
-function writeItemStack(w: Writer, itemId: number, count: number): void {
-	w.varint(count);
-	if (count > 0) w.varint(itemId).varint(0).varint(0); // no added or removed components
-}
-
 const PLAYER_INVENTORY_WINDOW = 0;
 
-/** Sets a slot of the player's own inventory. Slots 36 to 44 are the hotbar. */
-export const setInventorySlot = (slot: number, itemId: number, count: number) =>
+/**
+ * Sets a slot of the player's own inventory. Slots 36 to 44 are the hotbar.
+ * The player gets the whole stack, including what only they may see (see
+ * components.ts).
+ */
+export const setInventorySlot = (slot: number, stack: Stack | undefined) =>
 	packet(C.play.containerSetSlot, (w) => {
 		w.varint(PLAYER_INVENTORY_WINDOW).varint(0).i16(slot); // window, revision, slot
-		writeItemStack(w, itemId, count);
+		writeStack(w, stack, "owner");
 	});
 
 /**
@@ -319,11 +318,9 @@ function writeVelocity(w: Writer, x: number, y: number, z: number): void {
 	if (extended) w.varint(Math.floor(scale / 4));
 }
 
-export interface ItemEntityState {
+export interface ItemEntityState extends Stack {
 	entityId: number;
 	uuid: Uint8Array;
-	item: number;
-	count: number;
 	x: number;
 	y: number;
 	z: number;
@@ -333,10 +330,10 @@ export interface ItemEntityState {
 }
 
 /** Which item a dropped-item entity shows, and how many. */
-export const itemEntityStack = (entityId: number, itemId: number, count: number) =>
+export const itemEntityStack = (entityId: number, stack: Stack) =>
 	packet(C.play.setEntityData, (w) => {
 		w.varint(entityId).u8(META_ITEM_STACK).varint(META_TYPE_ITEM_STACK);
-		writeItemStack(w, itemId, count);
+		writeStack(w, stack, "others");
 		w.u8(0xff);
 	});
 
@@ -347,7 +344,7 @@ export const addItemEntity = (e: ItemEntityState) =>
 			writeVelocity(w, e.vx, e.vy, e.vz);
 			w.u8(0).u8(0).u8(0).varint(0); // pitch, yaw, head yaw, extra data
 		}),
-		itemEntityStack(e.entityId, e.item, e.count),
+		itemEntityStack(e.entityId, e),
 	]);
 
 /** Where an item came to rest. */
@@ -359,10 +356,7 @@ export const takeItem = (itemEntityId: number, collectorEntityId: number, count:
 
 export const setHeldSlot = (slot: number) => packet(C.play.setHeldSlot, (w) => w.varint(slot));
 
-export interface Stack {
-	item: number;
-	count: number;
-}
+export type { Stack };
 
 export const EQUIPMENT_MAIN_HAND = 0;
 export const EQUIPMENT_OFF_HAND = 1;
@@ -377,7 +371,7 @@ export const setEquipment = (entityId: number, equipment: [slot: number, stack: 
 		w.varint(entityId);
 		equipment.forEach(([slot, stack], index) => {
 			w.u8(slot | (index < equipment.length - 1 ? 0x80 : 0)); // the top bit says another entry follows
-			writeItemStack(w, stack?.item ?? 0, stack?.count ?? 0);
+			writeStack(w, stack, "others");
 		});
 	});
 

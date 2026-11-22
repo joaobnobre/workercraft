@@ -45,7 +45,8 @@ walk(join(cache, "libraries"));
 const classpath = [jar, ...jars].join(delimiter);
 const classes = join(cache, "conformance");
 
-execFileSync("javac", ["-nowarn", "-proc:none", "-Xlint:-deprecation", "-cp", classpath, "-d", classes, join(root, "test/conformance/Conformance.java")], { stdio: "inherit" });
+const sources = ["Conformance.java", "ItemTests.java"].map((file) => join(root, "test/conformance", file));
+execFileSync("javac", ["-nowarn", "-proc:none", "-Xlint:-deprecation", "-cp", classpath, "-d", classes, ...sources], { stdio: "inherit" });
 const run = spawnSync("java", ["-cp", [classes, classpath].join(delimiter), "Conformance", process.env.HOST ?? "127.0.0.1", process.env.PORT ?? String(devInstance().gamePort)], {
 	cwd: cache,
 	env,

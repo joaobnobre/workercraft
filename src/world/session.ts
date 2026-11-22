@@ -3,6 +3,7 @@
 
 import { Deframer, ProtocolError, Reader, concat } from "../net/bytes";
 import type { Text } from "../net/nbt";
+import { readClientStack } from "../protocol/components";
 import * as out from "../protocol/packets";
 import { BEFORE_26_3, DATA_PACK_VERSIONS, PROTOCOL, S, VERSION_NAME } from "../protocol/version";
 import { offlineUuid } from "./skins";
@@ -444,9 +445,8 @@ export class Session {
 			}
 			case S.play.setCreativeSlot: {
 				const slot = r.i16();
-				const count = r.varint();
-				// Whatever follows the item id (enchantments, names, ...) is not kept.
-				return world.creativeSlot(player, slot, count > 0 ? r.varint() : 0, count);
+				// With its components; which of them reach anyone else is up to components.ts.
+				return world.creativeSlot(player, slot, readClientStack(r));
 			}
 			case S.play.pickItemFromBlock:
 				return world.pickBlock(player, r.position());

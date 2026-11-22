@@ -764,6 +764,8 @@ public class Conformance {
 		say("skip queue, cookie requests and transfers between two servers: run the queue example and `npm run test:queue` (README, \"A queue\")");
 		Thread.sleep(500);
 
+		ItemTests.run(host, port, suffix, baseX + 40, baseZ); // item components, see ItemTests.java
+
 		for (Client client : List.of(alice, bob, again, carol)) check("nothing " + client.name + " received was unreadable", client.error == null, client.error);
 		Map<String, Integer> seen = new java.util.TreeMap<>();
 		for (Client client : List.of(alice, bob, again, carol)) client.counts.forEach((type, count) -> seen.merge(type, count, Integer::sum));

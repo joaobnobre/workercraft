@@ -2,11 +2,12 @@
 // itself, so the server only has to agree with it on where the item ends up:
 // it runs the same simple physics and tells clients the final resting place.
 
-export interface DroppedItem {
+import type { Stack } from "../protocol/components";
+
+/** The stack it is: its item, count and the components it took along. */
+export interface DroppedItem extends Stack {
 	entityId: number;
 	uuid: Uint8Array;
-	item: number;
-	count: number;
 	x: number;
 	y: number;
 	z: number;

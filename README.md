@@ -66,6 +66,9 @@ Works, and covered by the tests:
 - The item in a player's hand, and their armour, shown to other players
 - Inventories remembered between sessions
 - Dropping items, seeing them on the ground, picking them up
+- Items keeping their enchantments, names, potions, colours, patterns, the
+  contents of a shulker box and other data components, checked before anyone
+  else sees them ([Items](#items) says which, and where)
 - Middle-click pick block
 - Plugins as separate Workers, including cancelling events
 - Transfers to another server and cookies, in every phase that has them,
@@ -88,7 +91,11 @@ Not there:
   pick them up.
 - Levers and buttons move and click but power nothing.
 - Double chests do not join.
-- An item keeps only its type and count, so enchantments and names are lost.
+- Item components the server does not understand (books, maps, bundles,
+  attribute modifiers, custom data and most of the game's 120 or so types)
+  stay with the player who has the item and are lost when it is dropped or
+  the player leaves; see [Items](#items). Middle-click with Ctrl does not
+  copy a block's data.
   Items on the ground are not saved.
 
 How far it has been tried with the real game: two people have been on the
@@ -101,7 +108,12 @@ whether a refused block leaves anything behind on a real game's screen has
 not been tried. Transfers, cookies and the queue's line above the hotbar have
 not been tried with the real game at all: whether it follows the transfer,
 takes the cookie along and shows the line is up to the game, and only the
-conformance test's client has done so.
+conformance test's client has done so. Item components have not been tried with the real game
+either: the conformance test shows that the game decodes every stack the
+server sends and that it equals the one built, not that it is drawn right (a
+glint, a banner's patterns or a head's skin in someone's hand), nor how the
+real game's creative screen behaves when the server's copy of a stack lacks
+a component it did not understand.
 
 ### What holds a block
 
@@ -125,6 +137,66 @@ nearest to where the player looks first. Simplified:
   some only when the side that holds them changes, which matters only for a
   block saved somewhere it could not have been put: it stays until something
   next to it changes.
+
+### Items
+
+An item stack carries data components besides its type and count:
+enchantments, a name, a potion, a colour, the contents of a shulker box, and
+so on, each with its own encoding. A client sends a stack with the length of
+each value in front of it; the server sends one without, so whoever reads it
+must decode every value, and a client that cannot decode one is disconnected.
+Anyone can join this server and send anything, so nothing a client sent is
+passed on to another client on trust.
+
+The components the server understands are read field by field, checked
+(every number in range, every enchantment, potion, pattern or item id one the
+game has) and written out again by the server itself: `custom_name`,
+`item_name`, `lore`, `rarity`, `enchantments`, `stored_enchantments`,
+`enchantment_glint_override`, `unbreakable`, `damage`, `repair_cost`,
+`dyed_color`, `base_color`, `potion_contents`, `suspicious_stew_effects`,
+`ominous_bottle_amplifier`, `fireworks`, `firework_explosion`,
+`banner_patterns`, `tooltip_display`, `instrument`, `painting/variant`,
+`block_state`, `profile` and `container`. That covers everything the
+creative inventory puts on its items: the conformance test has the game
+build its creative tabs and checks that each of the 400 or so items there
+with components reaches another player as it was built. Text is rebuilt
+from plain text, translations and key names with colour and bold, italic,
+underlined, strikethrough and obfuscated; hover and click events, fonts and
+the like are dropped, and scores, entity selectors and NBT lookups are
+refused. A head may carry a name, an id and a skin property of the kind
+Mojang's profile servers hand out, but not a texture of the game's own put in
+place of the skin. A shulker box may hold a filled chest, but nothing deeper,
+and its contents must be understood too: a bundle inside one makes the whole
+contents not understood. Lists have limits (64 enchantments or lines of lore,
+16 effects, explosions or patterns, 27 slots in a container), one value may be
+4 KB and a stack's components 8 KB in all; past that a component is dropped.
+
+| | Checked components | Any other, or one that fails its check |
+|---|---|---|
+| The player's own inventory, while they are online | kept | kept, but never sent to anyone |
+| Shown to others in a hand, as armour or on the ground | shown, except a container's contents and lore, which nobody sees there | not shown |
+| Dropped and picked up, by anyone | kept | lost |
+| Saved inventories | kept, for the same game version | lost |
+
+Unchecked components are not even saved for the player who sent them: names
+are not verified, so whoever joins under a name next is not necessarily the
+same person, and a value the game cannot decode, sent back on every join,
+would lock that name out for good. A stack the game itself could not have
+sent (a component type that does not exist, a value running past the end of
+the packet) is a broken packet and disconnects its sender, as on a vanilla
+server.
+
+Two stacks merge (picking up, topping up a stack) only when their components
+are the same, and middle-click only picks a hotbar slot whose item has none,
+as in the game. Others are told about a change in a player's hands or armour,
+components included, at most once a tick, and drops from the creative
+inventory are limited the way a vanilla server limits them.
+
+Items are stored by name, so they survive a change of game version.
+Components hold ids that belong to one version (of enchantments, potions, the
+items in a container), so they are saved with the protocol they were saved
+under, and under another version the item comes back without them. Saved
+values are checked again when they are loaded.
 
 ## Run it
 
@@ -369,7 +441,9 @@ game can no longer read.
 
 A world does not depend on the version: blocks are stored by name, so one
 saved under 26.1 opens under 26.3. A block the running version does not have
-shows as air and is kept in storage.
+shows as air and is kept in storage. Items are stored by name too; their
+components only come back under the version they were saved with
+([Items](#items)).
 
 ## Layout
 
@@ -386,12 +460,13 @@ shows as air and is kept in storage.
 | `src/world/items.ts` | Physics of dropped items |
 | `src/world/skins.ts` | Offline UUIDs and the skin lookup |
 | `src/protocol/` | Packet builders and the version data |
+| `src/protocol/components.ts` | Item components: which are understood, checked and passed on |
 | `src/net/` | Varints, framing, NBT |
 | `src/plugins/`, `sdk/` | Plugin API, host and SDK |
 | `plugins/` | Example plugin Workers; `limbo` and `gate` are the queue |
 | `scripts/gen-data.mjs`, `scripts/Probe.java` | Generate version data from the server jar |
 | `scripts/dev.mjs` | `npm run dev`: the world and its plugins in one `wrangler dev` |
-| `test/conformance/` | The conformance test, judged by Mojang's packet code |
+| `test/conformance/` | The conformance test, judged by Mojang's packet code; `ItemTests.java` for items |
 | `test/e2e.mjs` | The bot suite (26.1 build only) |
 | `test/limits.mjs` | The test of the limits per address |
 
