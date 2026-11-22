@@ -98,10 +98,10 @@ on 26.3 they are covered by the conformance test, which proves the game can
 read what the server sends, not that it then does the right thing with it.
 What a block may be put on is checked there against the game's own rule;
 whether a refused block leaves anything behind on a real game's screen has
-not been tried. Transfers, cookies and the queue's line above the hotbar have not been tried
-with the real game at all: whether it follows the transfer, takes the cookie
-along and shows the line is up to the game, and only the conformance test's
-client has done so.
+not been tried. Transfers, cookies and the queue's line above the hotbar have
+not been tried with the real game at all: whether it follows the transfer,
+takes the cookie along and shows the line is up to the game, and only the
+conformance test's client has done so.
 
 ### What holds a block
 
