@@ -64,8 +64,9 @@ const optional = (state: string, direction: "clientbound" | "serverbound", name:
 /** Clientbound packet ids, by Mojang's packet names. */
 export const C = {
 	status: { response: cb("status", "status_response"), pong: cb("status", "pong_response") },
-	login: { disconnect: cb("login", "login_disconnect"), finished: cb("login", "login_finished") },
+	login: { cookieRequest: cb("login", "cookie_request"), disconnect: cb("login", "login_disconnect"), finished: cb("login", "login_finished") },
 	config: {
+		cookieRequest: cb("configuration", "cookie_request"),
 		customPayload: cb("configuration", "custom_payload"),
 		disconnect: cb("configuration", "disconnect"),
 		finish: cb("configuration", "finish_configuration"),
@@ -74,6 +75,8 @@ export const C = {
 		enabledFeatures: cb("configuration", "update_enabled_features"),
 		tags: cb("configuration", "update_tags"),
 		knownPacks: cb("configuration", "select_known_packs"),
+		storeCookie: cb("configuration", "store_cookie"),
+		transfer: cb("configuration", "transfer"),
 	},
 	play: {
 		addEntity: cb("play", "add_entity"),
@@ -83,6 +86,7 @@ export const C = {
 		blockUpdate: cb("play", "block_update"),
 		chunkBatchFinished: cb("play", "chunk_batch_finished"),
 		chunkBatchStart: cb("play", "chunk_batch_start"),
+		cookieRequest: cb("play", "cookie_request"),
 		disconnect: cb("play", "disconnect"),
 		entityPositionSync: cb("play", "entity_position_sync"),
 		forgetChunk: cb("play", "forget_level_chunk"),
@@ -110,10 +114,12 @@ export const C = {
 		setHeldSlot: cb("play", "set_held_slot"),
 		setTime: cb("play", "set_time"),
 		sound: cb("play", "sound"),
+		storeCookie: cb("play", "store_cookie"),
 		/** Since 26.3, where it took over from `animate` for arm swings. */
 		swingAnimation: optional("play", "clientbound", "swing_animation"),
 		systemChat: cb("play", "system_chat"),
 		tabList: cb("play", "tab_list"),
+		transfer: cb("play", "transfer"),
 	},
 };
 
@@ -121,9 +127,10 @@ export const C = {
 export const S = {
 	handshake: { intention: sb("handshake", "intention") },
 	status: { request: sb("status", "status_request"), ping: sb("status", "ping_request") },
-	login: { hello: sb("login", "hello"), acknowledged: sb("login", "login_acknowledged") },
+	login: { hello: sb("login", "hello"), acknowledged: sb("login", "login_acknowledged"), cookieResponse: sb("login", "cookie_response") },
 	config: {
 		clientInformation: sb("configuration", "client_information"),
+		cookieResponse: sb("configuration", "cookie_response"),
 		finish: sb("configuration", "finish_configuration"),
 		knownPacks: sb("configuration", "select_known_packs"),
 	},
@@ -133,6 +140,7 @@ export const S = {
 		chatCommand: sb("play", "chat_command"),
 		chatCommandSigned: sb("play", "chat_command_signed"),
 		clientInformation: sb("play", "client_information"),
+		cookieResponse: sb("play", "cookie_response"),
 		keepAlive: sb("play", "keep_alive"),
 		movePos: sb("play", "move_player_pos"),
 		pickItemFromBlock: sb("play", "pick_item_from_block"),

@@ -159,6 +159,7 @@ export const tabList = (header: Text, footer: Text) =>
 		writeNbt(w, footer as Nbt);
 	});
 
+/** A chat line, or with `actionBar` the line above the hotbar that fades after a few seconds. */
 export const systemChat = (text: Text, actionBar = false) =>
 	packet(C.play.systemChat, (w) => {
 		writeNbt(w, text as Nbt);
@@ -405,3 +406,21 @@ export const blockSound = (sound: number, x: number, y: number, z: number, volum
 			.f32(pitch)
 			.i64(BigInt(Math.floor(Math.random() * 2 ** 32))), // seed for which variation plays
 	);
+
+// ---- cookies and transfers -------------------------------------------------
+//
+// A cookie is up to 5120 bytes the client keeps under a namespaced key for as
+// long as it is connected, and takes along when a server transfers it to
+// another one. The layouts are the same in every phase that has the packet.
+
+/** Most bytes a cookie can hold (ClientboundStoreCookiePacket.MAX_PAYLOAD_SIZE). */
+export const COOKIE_MAX_BYTES = 5120;
+
+/** Asks the client for the cookie stored under `key`. Login, configuration and play. */
+export const cookieRequest = (phase: "login" | "config" | "play", key: string) => packet(C[phase].cookieRequest, (w) => w.string(key));
+
+export const storeCookie = (phase: "config" | "play", key: string, payload: Uint8Array) =>
+	packet(C[phase].storeCookie, (w) => w.string(key).varint(payload.length).bytes(payload));
+
+/** Tells the client to connect to another server, saying in its handshake that it was transferred. */
+export const transfer = (phase: "config" | "play", host: string, port: number) => packet(C[phase].transfer, (w) => w.string(host).varint(port));
