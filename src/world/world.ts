@@ -113,9 +113,14 @@ const EYE_HEIGHT = 1.62;
 const NOON = 6000;
 const CHAT_BURST = 5;
 const CHAT_REFILL_MS = 1500;
+/** Ticks between two calls of the plugins' onTimer: once a second. */
+const TIMER_TICKS = 20;
 
 export class World extends DurableObject<Env> {
 	private players = new Map<string, Player>();
+	/** Players whose login the plugins are deciding on, by lower-case name. */
+	private logins = new Map<string, Session>();
+	private timerCount = 0;
 	private items = new Map<number, DroppedItem>();
 	private blocks: BlockStore;
 	private skins: SkinCache;
@@ -162,6 +167,22 @@ export class World extends DurableObject<Env> {
 	}
 
 	// ---- joining and leaving -------------------------------------------------
+
+	/**
+	 * Asks the plugins whether a player who just logged in may come in. Returns
+	 * why not, or undefined. While they decide, the player's name finds this
+	 * connection, so that a plugin can ask it for cookies.
+	 */
+	async admit(session: Session): Promise<Text | undefined> {
+		const key = session.name.toLowerCase();
+		this.logins.get(key)?.disconnect({ translate: "multiplayer.disconnect.duplicate_login" });
+		this.logins.set(key, session);
+		try {
+			return await this.plugins.login({ name: session.name, uuid: formatUuid(session.uuid), transferred: session.transferred });
+		} finally {
+			if (this.logins.get(key) === session) this.logins.delete(key);
+		}
+	}
 
 	async join(session: Session): Promise<void> {
 		// The skin lookup started at login. If Mojang has not answered by now the
@@ -283,6 +304,7 @@ export class World extends DurableObject<Env> {
 			for (const { run } of due) run();
 		}
 		this.tickItems();
+		if (this.tickCount % TIMER_TICKS === 0) void this.plugins.timer({ count: this.timerCount++ });
 		for (const player of this.players.values()) player.session.flush();
 		const now = Date.now();
 		if (now - this.keepAliveSentAt < KEEP_ALIVE_INTERVAL_MS) return;
@@ -528,6 +550,14 @@ export class World extends DurableObject<Env> {
 		if (turned) packets.push(out.rotateHead(player.entityId, player.yaw));
 		this.broadcastSoon(concat(packets), player);
 		this.sendChunks(player);
+	}
+
+	/** Sends the player to another server. They leave this world now, as on a disconnect. */
+	transfer(player: Player, host: string, port: number): void {
+		player.session.transfer(host, port);
+		this.leave(player);
+		// The connection stays open until the client hangs up; what it sends meanwhile is ignored.
+		player.session.player = undefined;
 	}
 
 	teleport(player: Player, x: number, y: number, z: number): void {
@@ -814,6 +844,12 @@ export class World extends DurableObject<Env> {
 		return this.players.get(String(name).toLowerCase());
 	}
 
+	/** The connection of a player being let in, or else of the player in the world. */
+	findSession(name: string): Session | undefined {
+		const key = String(name).toLowerCase();
+		return this.logins.get(key) ?? this.players.get(key)?.session;
+	}
+
 	playerInfos(): PlayerInfo[] {
 		return [...this.players.values()].map(info);
 	}
@@ -823,15 +859,13 @@ export class World extends DurableObject<Env> {
 	}
 }
 
+function formatUuid(uuid: Uint8Array): string {
+	const hex = bytesToUuid(uuid);
+	return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 function info(player: Player): PlayerInfo {
-	const hex = bytesToUuid(player.uuid);
-	return {
-		name: player.name,
-		uuid: `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`,
-		x: player.x,
-		y: player.y,
-		z: player.z,
-	};
+	return { name: player.name, uuid: formatUuid(player.uuid), x: player.x, y: player.y, z: player.z, transferred: player.session.transferred };
 }
 
 /**
@@ -848,6 +882,9 @@ class ServerApi extends RpcTarget implements Server {
 	}
 	async message(player: string, text: Text): Promise<void> {
 		this.world.findPlayer(player)?.session.send(out.systemChat(text));
+	}
+	async actionBar(player: string, text: Text): Promise<void> {
+		this.world.findPlayer(player)?.session.send(out.systemChat(text, true));
 	}
 	async players(): Promise<PlayerInfo[]> {
 		return this.world.playerInfos();
@@ -868,5 +905,17 @@ class ServerApi extends RpcTarget implements Server {
 	}
 	async kick(player: string, reason: Text): Promise<void> {
 		this.world.findPlayer(player)?.session.disconnect(reason);
+	}
+	async transfer(player: string, host: string, port: number): Promise<void> {
+		const target = this.world.findPlayer(player);
+		if (target) this.world.transfer(target, host, port);
+	}
+	async storeCookie(player: string, key: string, payload: Uint8Array): Promise<void> {
+		this.world.findPlayer(player)?.session.storeCookie(key, payload);
+	}
+	async requestCookie(player: string, key: string): Promise<Uint8Array | undefined> {
+		const session = this.world.findSession(player);
+		if (!session) throw new Error(`${player} is not connected`);
+		return session.requestCookie(key);
 	}
 }

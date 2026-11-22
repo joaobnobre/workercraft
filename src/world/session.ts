@@ -18,6 +18,27 @@ const MAX_QUEUED_BYTES = 24 << 20;
 /** How long a closing connection waits for its last bytes to go out. */
 const FLUSH_TIMEOUT_MS = 2000;
 
+/**
+ * Packets, and bytes of them, read while earlier ones are still being
+ * handled. Past either, reading pauses until the handlers catch up.
+ */
+const MAX_BACKLOG = 256;
+const MAX_BACKLOG_BYTES = 1 << 20;
+/** How long a cookie request waits for the client's answer. */
+const COOKIE_TIMEOUT_MS = 3000;
+/** Cookie requests that may be waiting on one connection at once. */
+const MAX_COOKIE_REQUESTS = 16;
+/** Most characters in a transfer's host name or a cookie's key (FriendlyByteBuf.readUtf). */
+const MAX_STRING_LENGTH = 32767;
+/**
+ * A transferred client hangs up by itself, the way it does when a vanilla
+ * server transfers it. One that has not by then is disconnected.
+ */
+const TRANSFER_GRACE_MS = 10_000;
+
+/** The handshake's intent when the client was sent here by another server. */
+const INTENT_TRANSFER = 3;
+
 /** What the numbers in a player_action packet mean. 26.3 added one in the middle. */
 export type PlayerAction = "startDigging" | "changeDigDirection" | "cancelDigging" | "finishDigging" | "dropStack" | "dropOne" | "releaseItem" | "swapHands" | "stab";
 const PLAYER_ACTIONS: PlayerAction[] = BEFORE_26_3
@@ -36,6 +57,27 @@ export interface ClientSettings {
 
 type Phase = "handshake" | "login" | "config" | "play" | "closed";
 
+interface CookieWait {
+	resolve(payload: Uint8Array | undefined): void;
+	reject(error: Error): void;
+	timer: ReturnType<typeof setTimeout>;
+}
+
+/**
+ * A cookie key as the game reads it: "namespace:path", where a key without a
+ * namespace is in "minecraft". Throws for anything the game would not accept.
+ */
+export function cookieKey(key: unknown): string {
+	if (typeof key !== "string" || key.length > MAX_STRING_LENGTH) throw new Error("A cookie key is a string such as \"myplugin:ticket\"");
+	const colon = key.indexOf(":");
+	const namespace = colon < 0 ? "minecraft" : key.slice(0, colon);
+	const path = colon < 0 ? key : key.slice(colon + 1);
+	if (!/^[a-z0-9_.-]+$/.test(namespace) || namespace === ".." || !/^[a-z0-9_.\/-]+$/.test(path)) {
+		throw new Error(`"${key}" is not a valid cookie key: lower-case letters, digits, _ . - (and / after the colon), such as "myplugin:ticket"`);
+	}
+	return `${namespace}:${path}`;
+}
+
 export class Session {
 	phase: Phase = "handshake";
 	name = "";
@@ -43,8 +85,17 @@ export class Session {
 	skin: Promise<out.ProfileProperty[]> = Promise.resolve([]);
 	settings: ClientSettings = { viewDistance: 8, skinParts: 0x7f };
 	player?: Player;
+	/** The client said in its handshake that another server transferred it here. */
+	transferred = false;
 
 	private protocol = 0;
+	/**
+	 * The phase the next packet from the client belongs to. It runs ahead of
+	 * `phase` while packets wait to be handled, see run().
+	 */
+	private incoming: Phase = "handshake";
+	private cookieWaits = new Map<string, CookieWait[]>();
+	private cookieWaitCount = 0;
 	private sentRegistries = false;
 	private outbox: Uint8Array[] = [];
 	private queuedBytes = 0;
@@ -69,24 +120,58 @@ export class Session {
 		const loginDeadline = setTimeout(() => {
 			if (this.phase !== "play") this.close();
 		}, LOGIN_TIMEOUT_MS);
+		// Packets are handled one at a time, in order, but reading does not wait
+		// for that: a handler may be waiting for a plugin that waits for a cookie,
+		// and the client's answer is a packet that comes after the one being
+		// handled. Cookie answers are therefore taken as they are read, and
+		// everything else joins the queue of packets to handle.
+		let handling = Promise.resolve();
+		let backlog = 0;
+		let backlogBytes = 0;
 		try {
 			while (this.phase !== "closed") {
 				const { value, done } = await this.reader.read();
 				if (done) break;
 				for (const data of deframer.push(value)) {
-					await this.handle(new Reader(data));
-					if ((this.phase as Phase) === "closed") break;
+					const r = new Reader(data);
+					const id = r.varint();
+					if (this.takeCookieResponse(id, r)) continue;
+					this.advanceIncoming(id);
+					backlog++;
+					backlogBytes += data.length;
+					handling = handling.then(async () => {
+						backlog--;
+						backlogBytes -= data.length;
+						if (this.phase !== "closed") await this.handle(id, r).catch((error) => this.fail(error));
+					});
 				}
+				if (backlog > MAX_BACKLOG || backlogBytes > MAX_BACKLOG_BYTES) await handling;
 			}
 		} catch (error) {
-			if (error instanceof ProtocolError) this.disconnect(`Bad packet: ${error.message}`);
-			// Anything else is the socket ending abruptly, which is how most clients leave.
+			this.fail(error);
 		} finally {
 			clearTimeout(loginDeadline);
 			this.close();
 			if (this.player) this.world.leave(this.player);
+			// A handler still running sees the connection closed and stops; one that
+			// was letting the player in may have done so meanwhile.
+			await handling;
+			if (this.player) this.world.leave(this.player);
 			await Promise.race([this.lastWrite, new Promise((resolve) => setTimeout(resolve, FLUSH_TIMEOUT_MS))]);
 		}
+	}
+
+	private fail(error: unknown): void {
+		if (error instanceof ProtocolError) this.disconnect(`Bad packet: ${error.message}`);
+		// Anything else is the socket ending abruptly, which is how most clients leave.
+		else this.close();
+	}
+
+	/** Follows the client's switches of phase as its packets are read, before they are handled. */
+	private advanceIncoming(id: number): void {
+		if (this.incoming === "handshake") this.incoming = "login";
+		else if (this.incoming === "login" && id === S.login.acknowledged) this.incoming = "config";
+		else if (this.incoming === "config" && id === S.config.finish) this.incoming = "play";
 	}
 
 	/**
@@ -138,13 +223,101 @@ export class Session {
 	close(): void {
 		if (this.phase === "closed") return;
 		this.phase = "closed";
+		for (const waits of this.cookieWaits.values()) {
+			for (const wait of waits) {
+				clearTimeout(wait.timer);
+				wait.reject(new Error("The player disconnected before answering"));
+			}
+		}
+		this.cookieWaits.clear();
 		// Ends the read loop in run(). The socket itself closes when run() returns,
 		// which is once everything queued (a disconnect message, say) is written.
 		this.reader.cancel().catch(() => {});
 	}
 
-	private async handle(r: Reader): Promise<void> {
-		const id = r.varint();
+	// ---- cookies and transfers ----------------------------------------------
+
+	/**
+	 * Asks the client for a cookie. Resolves to its bytes, or to undefined when
+	 * the client has none under that key. A client only has cookies that a
+	 * server stored during this connection or, when it was transferred, the
+	 * one before it. Rejects when the client does not answer in time.
+	 */
+	requestCookie(key: string): Promise<Uint8Array | undefined> {
+		const normalized = cookieKey(key);
+		const phase = this.phase;
+		if (phase !== "login" && phase !== "config" && phase !== "play") return Promise.reject(new Error("The player is not connected"));
+		if (this.cookieWaitCount >= MAX_COOKIE_REQUESTS) return Promise.reject(new Error("Too many cookie requests are waiting for this player"));
+		return new Promise((resolve, reject) => {
+			const waits = this.cookieWaits.get(normalized) ?? [];
+			const wait: CookieWait = {
+				resolve,
+				reject,
+				timer: setTimeout(() => {
+					waits.splice(waits.indexOf(wait), 1);
+					this.cookieWaitCount--;
+					reject(new Error(`The player did not answer the request for cookie ${normalized}`));
+				}, COOKIE_TIMEOUT_MS),
+			};
+			waits.push(wait);
+			this.cookieWaits.set(normalized, waits);
+			this.cookieWaitCount++;
+			this.send(out.cookieRequest(phase, normalized));
+		});
+	}
+
+	/**
+	 * Reads a cookie answer, which may arrive in any phase that has one. The
+	 * client is not trusted to answer only what was asked, or only once: an
+	 * answer nobody is waiting for is dropped.
+	 */
+	private takeCookieResponse(id: number, r: Reader): boolean {
+		const phase = this.incoming;
+		const expected = phase === "login" ? S.login.cookieResponse : phase === "config" ? S.config.cookieResponse : phase === "play" ? S.play.cookieResponse : undefined;
+		if (id !== expected) return false;
+		let key: string;
+		try {
+			key = cookieKey(r.string(MAX_STRING_LENGTH));
+		} catch (error) {
+			throw error instanceof ProtocolError ? error : new ProtocolError("Bad cookie key");
+		}
+		let payload: Uint8Array | undefined;
+		if (r.bool()) {
+			const length = r.varint();
+			if (length < 0 || length > out.COOKIE_MAX_BYTES) throw new ProtocolError("Cookie is too large");
+			payload = r.bytes(length).slice();
+		}
+		const wait = this.cookieWaits.get(key)?.shift();
+		if (wait) {
+			clearTimeout(wait.timer);
+			this.cookieWaitCount--;
+			wait.resolve(payload);
+		}
+		return true;
+	}
+
+	/** Has the client keep a cookie for the rest of this connection and across a transfer. */
+	storeCookie(key: string, payload: Uint8Array): void {
+		const normalized = cookieKey(key);
+		if (!(payload instanceof Uint8Array)) throw new Error("A cookie's payload is a Uint8Array");
+		if (payload.length > out.COOKIE_MAX_BYTES) throw new Error(`A cookie holds at most ${out.COOKIE_MAX_BYTES} bytes, not ${payload.length}`);
+		if (this.phase !== "config" && this.phase !== "play") throw new Error("Cookies can only be stored once the player is past login");
+		this.send(out.storeCookie(this.phase, normalized, payload));
+	}
+
+	/**
+	 * Sends the client to another server. The client hangs up by itself; the
+	 * world forgets the player at once (see World.transfer).
+	 */
+	transfer(host: string, port: number): void {
+		if (typeof host !== "string" || host.length === 0 || host.length > MAX_STRING_LENGTH) throw new Error("A transfer needs a host name");
+		if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`${port} is not a port`);
+		if (this.phase !== "config" && this.phase !== "play") throw new Error("Players can only be transferred once they are past login");
+		this.send(out.transfer(this.phase, host, port));
+		setTimeout(() => this.close(), TRANSFER_GRACE_MS);
+	}
+
+	private async handle(id: number, r: Reader): Promise<void> {
 		switch (this.phase) {
 			case "handshake":
 				return this.onHandshake(id, r);
@@ -164,7 +337,8 @@ export class Session {
 		r.u16(); // server port
 		const intent = r.varint();
 		// 1 is a server list ping, which the Worker answers without waking this object.
-		if (intent !== 2 && intent !== 3) throw new ProtocolError("Unsupported handshake intent");
+		if (intent !== 2 && intent !== INTENT_TRANSFER) throw new ProtocolError("Unsupported handshake intent");
+		this.transferred = intent === INTENT_TRANSFER;
 		this.phase = "login";
 	}
 
@@ -179,6 +353,11 @@ export class Session {
 			if (this.world.isFull) return this.disconnect({ translate: "multiplayer.disconnect.server_full" });
 			this.name = name;
 			this.uuid = await offlineUuid(name);
+			// Plugins may refuse the player here, before anything of the world is
+			// sent. They may ask the client for cookies while they decide.
+			const refusal = await this.world.admit(this);
+			if (this.phase !== "login") return;
+			if (refusal) return this.disconnect(refusal);
 			this.skin = this.world.lookupSkin(name, claimedUuid);
 			this.send(out.loginFinished(this.uuid, name, []));
 		} else if (id === S.login.acknowledged) {

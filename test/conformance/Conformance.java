@@ -16,6 +16,13 @@
 // cares about. It also says who is online and whether each has a signed skin;
 // PLAYER names the account to join as (somebody already online under that
 // name is disconnected).
+//
+// With QUEUE set it runs the queue example instead (see README, "A queue"):
+// it joins the limbo at host:port, waits to be transferred, follows the
+// transfer to the destination with the cookie it was given, and tries the
+// destination with no ticket, a tampered one, an expired one and somebody
+// else's. QUEUE_SECRET must be the secret both servers sign with: the test
+// makes tickets of its own from the layout documented in plugins/gate/ticket.ts.
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
@@ -23,6 +30,8 @@ import java.io.DataInputStream;
 import java.io.EOFException;
 import java.io.OutputStream;
 import java.net.Socket;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -34,6 +43,8 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.BooleanSupplier;
 import java.util.function.Predicate;
 import java.util.stream.Stream;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 import net.minecraft.SharedConstants;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
@@ -50,6 +61,8 @@ import net.minecraft.network.RegistryFriendlyByteBuf;
 import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.common.ClientboundDisconnectPacket;
 import net.minecraft.network.protocol.common.ClientboundKeepAlivePacket;
+import net.minecraft.network.protocol.common.ClientboundStoreCookiePacket;
+import net.minecraft.network.protocol.common.ClientboundTransferPacket;
 import net.minecraft.network.protocol.common.ClientboundUpdateTagsPacket;
 import net.minecraft.network.protocol.common.ServerboundClientInformationPacket;
 import net.minecraft.network.protocol.common.ServerboundKeepAlivePacket;
@@ -59,6 +72,8 @@ import net.minecraft.network.protocol.configuration.ClientboundSelectKnownPacks;
 import net.minecraft.network.protocol.configuration.ConfigurationProtocols;
 import net.minecraft.network.protocol.configuration.ServerboundFinishConfigurationPacket;
 import net.minecraft.network.protocol.configuration.ServerboundSelectKnownPacks;
+import net.minecraft.network.protocol.cookie.ClientboundCookieRequestPacket;
+import net.minecraft.network.protocol.cookie.ServerboundCookieResponsePacket;
 import net.minecraft.network.protocol.game.ClientboundAddEntityPacket;
 import net.minecraft.network.protocol.game.ClientboundBlockEntityDataPacket;
 import net.minecraft.network.protocol.game.ClientboundBlockUpdatePacket;
@@ -105,6 +120,7 @@ import net.minecraft.network.protocol.status.ServerboundStatusRequestPacket;
 import net.minecraft.network.protocol.status.StatusProtocols;
 import net.minecraft.network.syncher.EntityDataSerializers;
 import net.minecraft.network.syncher.SynchedEntityData;
+import net.minecraft.resources.Identifier;
 import net.minecraft.resources.RegistryDataLoader;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.Bootstrap;
@@ -169,11 +185,30 @@ public class Conformance {
 		return until(condition, 5000);
 	}
 
+	/** How a test client answers the server's requests for cookies. */
+	enum Cookies {
+		/** Like the game: with the cookie it holds under that key, or with none. */
+		ANSWER,
+		/** Never. */
+		SILENT,
+		/** With a key nobody asked for first, then the right answer twice. */
+		NOISY,
+	}
+
 	/** One connection, playing the part of the game client. */
 	static class Client {
 		final String name;
 		final String host;
 		final int port;
+		ClientIntent intent = ClientIntent.LOGIN;
+		Cookies answerCookies = Cookies.ANSWER;
+		/** The cookies this client holds, as the game keeps them across a transfer. */
+		final Map<Identifier, byte[]> cookies = new ConcurrentHashMap<>();
+		/** The phase of each cookie request the server sent. */
+		final List<String> cookieRequests = new CopyOnWriteArrayList<>();
+		volatile ClientboundTransferPacket transfer;
+		/** For the queue test: how often a watching player had seen this name listed before this client tried to join. */
+		long listedBefore;
 		Socket socket;
 		DataInputStream in;
 		OutputStream out;
@@ -280,7 +315,7 @@ public class Conformance {
 		void join() throws Exception {
 			connect();
 			outbound = HandshakeProtocols.SERVERBOUND;
-			send(new ClientIntentionPacket(SharedConstants.getProtocolVersion(), host, port, ClientIntent.LOGIN));
+			send(new ClientIntentionPacket(SharedConstants.getProtocolVersion(), host, port, intent));
 			outbound = LoginProtocols.SERVERBOUND;
 			inbound = LoginProtocols.CLIENTBOUND;
 			send(new ServerboundHelloPacket(name, UUID.randomUUID()));
@@ -307,6 +342,26 @@ public class Conformance {
 		private void handle(Packet<?> packet) throws Exception {
 			if (packet instanceof ClientboundLoginDisconnectPacket p) throw new IllegalStateException("Refused at login: " + p.reason().getString());
 			if (packet instanceof ClientboundDisconnectPacket p) throw new IllegalStateException("Disconnected: " + p.reason().getString());
+
+			if (packet instanceof ClientboundCookieRequestPacket p) {
+				cookieRequests.add(phase);
+				if (answerCookies == Cookies.SILENT) return;
+				if (answerCookies == Cookies.NOISY) send(new ServerboundCookieResponsePacket(Identifier.fromNamespaceAndPath("test", "never_asked"), new byte[] { 1, 2, 3 }));
+				send(new ServerboundCookieResponsePacket(p.key(), cookies.get(p.key())));
+				if (answerCookies == Cookies.NOISY) send(new ServerboundCookieResponsePacket(p.key(), cookies.get(p.key())));
+				return;
+			}
+			if (packet instanceof ClientboundStoreCookiePacket p) {
+				cookies.put(p.key(), p.payload());
+				return;
+			}
+			if (packet instanceof ClientboundTransferPacket p) {
+				// The game hangs up and connects to the new address.
+				transfer = p;
+				closed = true;
+				socket.close();
+				return;
+			}
 
 			if (packet instanceof ClientboundLoginFinishedPacket) {
 				send(ServerboundLoginAcknowledgedPacket.INSTANCE);
@@ -454,7 +509,20 @@ public class Conformance {
 		}
 
 		<T extends Packet<?>> boolean awaitPacket(Class<T> type, Predicate<T> matches) throws InterruptedException {
-			return until(() -> received(type).stream().anyMatch(matches));
+			return awaitPacket(type, matches, 5000);
+		}
+
+		<T extends Packet<?>> boolean awaitPacket(Class<T> type, Predicate<T> matches, long timeoutMs) throws InterruptedException {
+			return until(() -> received(type).stream().anyMatch(matches), timeoutMs);
+		}
+
+		boolean sawActionBar(String text, long timeoutMs) throws InterruptedException {
+			return awaitPacket(ClientboundSystemChatPacket.class, p -> p.overlay() && p.content().getString().contains(text), timeoutMs);
+		}
+
+		/** How often the server told this client that a player of that name is here. */
+		long timesListed(String player) {
+			return received(ClientboundPlayerInfoUpdatePacket.class).stream().flatMap(p -> p.newEntries().stream()).filter(e -> e.profile().name().equals(player)).count();
 		}
 
 		boolean sawChat(String text) throws InterruptedException {
@@ -510,7 +578,8 @@ public class Conformance {
 		say("Judging with Minecraft " + SharedConstants.getCurrentVersion().name() + " (protocol " + SharedConstants.getProtocolVersion() + ")");
 
 		try {
-			run(host, port);
+			if (System.getenv("QUEUE") != null) runQueue(host, port, System.getenv("QUEUE_SECRET"));
+			else run(host, port);
 		} catch (Throwable problem) {
 			check("the run finishes", false, problem);
 			if (System.getenv("CONFORMANCE_TRACE") != null) problem.printStackTrace();
@@ -673,15 +742,136 @@ public class Conformance {
 			again.describe(sign) + ", block entity " + again.blockEntities.get(sign) + ", " + again.chunks.size() + " chunks, at " + again.position);
 		check("the chunk lists the chest", again.blockEntities.containsKey(chest), again.describe(chest));
 		check("block states are remembered", is(again.block(stairs), Blocks.OAK_STAIRS, "facing=north"), again.describe(stairs));
+
+		// ---- transfers and cookies ----
+		Client carol = new Client(host, port, "carol_" + suffix);
+		carol.intent = ClientIntent.TRANSFER;
+		carol.join();
+		check("a client that was transferred here is let in", until(() -> carol.error != null || carol.entityId >= 0, 15000) && carol.error == null, carol.error);
+		if (carol.error != null) return;
+		carol.send(new ServerboundCookieResponsePacket(Identifier.fromNamespaceAndPath("test", "never_asked"), new byte[] { 1, 2, 3 }));
+		carol.command("list");
+		check("a cookie nobody asked for is ignored", carol.sawChat("online:") && carol.error == null, carol.error);
+		say("skip queue, cookie requests and transfers between two servers: run the queue example and `npm run test:queue` (README, \"A queue\")");
 		Thread.sleep(500);
 
-		for (Client client : List.of(alice, bob, again)) check("nothing " + client.name + " received was unreadable", client.error == null, client.error);
+		for (Client client : List.of(alice, bob, again, carol)) check("nothing " + client.name + " received was unreadable", client.error == null, client.error);
 		Map<String, Integer> seen = new java.util.TreeMap<>();
-		for (Client client : List.of(alice, bob, again)) client.counts.forEach((type, count) -> seen.merge(type, count, Integer::sum));
+		for (Client client : List.of(alice, bob, again, carol)) client.counts.forEach((type, count) -> seen.merge(type, count, Integer::sum));
 		say("\nPacket types decoded: " + seen.size());
 		seen.forEach((type, count) -> say("  " + count + " x " + type));
 		bob.quit();
 		again.quit();
+		carol.quit();
+	}
+
+	static final Identifier TICKET = Identifier.fromNamespaceAndPath("queue", "ticket");
+
+	/** A queue ticket made the way plugins/gate/ticket.ts documents it, not with its code. */
+	static byte[] ticket(String secret, String name, long expiresAt) throws Exception {
+		byte[] nameBytes = name.getBytes(StandardCharsets.US_ASCII);
+		byte[] signed = ByteBuffer.allocate(10 + nameBytes.length).put((byte) 1).putLong(expiresAt).put((byte) nameBytes.length).put(nameBytes).array();
+		Mac mac = Mac.getInstance("HmacSHA256");
+		mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+		return ByteBuffer.allocate(signed.length + 32).put(signed).put(mac.doFinal(signed)).array();
+	}
+
+	/**
+	 * Tries to get into the destination. Returns the client, which is in the
+	 * world or was turned away; the caller checks which.
+	 */
+	static Client arrive(String host, int port, String name, ClientIntent intent, byte[] ticket, Cookies answering, Client watcher) throws Exception {
+		Client client = new Client(host, port, name);
+		client.listedBefore = watcher == null ? 0 : watcher.timesListed(name);
+		client.intent = intent;
+		client.answerCookies = answering;
+		if (ticket != null) client.cookies.put(TICKET, ticket);
+		client.join();
+		until(() -> client.error != null || client.entityId >= 0, 15000);
+		return client;
+	}
+
+	/** Checks that the destination turned a client away at login, with a reason that says why. */
+	static void refused(String label, Client client, String reason, Client watcher) throws InterruptedException {
+		boolean turnedAway = client.error != null && client.error.startsWith("Refused at login") && client.received(ClientboundLoginFinishedPacket.class).isEmpty();
+		check(label + " is turned away at login", turnedAway && client.error.contains(reason), client.error);
+		check(label + " never appears in the world", watcher.timesListed(client.name) == client.listedBefore);
+	}
+
+	static void runQueue(String host, int port, String secret) throws Exception {
+		if (secret == null || secret.isEmpty()) throw new IllegalStateException("QUEUE_SECRET is not set");
+		String suffix = Long.toString(System.nanoTime() % 1679616, 36);
+
+		// ---- the limbo ----
+		// Three in line, so that the last is never first even right after somebody's turn.
+		Client first = new Client(host, port, "q1_" + suffix);
+		Client middle = new Client(host, port, "q0_" + suffix);
+		Client second = new Client(host, port, "q2_" + suffix);
+		for (Client client : List.of(first, middle, second)) {
+			client.join();
+			check(client.name + " gets into the limbo", until(() -> client.error != null || client.entityId >= 0, 15000) && client.error == null, client.error);
+			if (client.error != null) return;
+		}
+		check("the place in the queue shows above the hotbar", second.awaitPacket(ClientboundSystemChatPacket.class, p -> p.overlay() && p.content().getString().matches("Place in queue: [23] of [23].*"), 8000),
+			second.received(ClientboundSystemChatPacket.class).stream().map(p -> (p.overlay() ? "[bar] " : "") + p.content().getString()).toList());
+		check("the first in line is transferred", until(() -> first.transfer != null || first.error != null, 30000), first.error);
+		if (first.transfer == null) return;
+		check("the transfer names the destination", first.transfer.port() > 0 && !first.transfer.host().isEmpty(), first.transfer.host() + ":" + first.transfer.port());
+		byte[] issued = first.cookies.get(TICKET);
+		check("a ticket is stored as a cookie, before the transfer", issued != null && first.packets.indexOf(first.received(ClientboundStoreCookiePacket.class).get(0)) < first.packets.indexOf(first.transfer),
+			issued == null ? first.cookies.keySet() : issued.length + " bytes");
+		if (issued == null) return;
+		check("the ticket is laid out as documented", issued.length == 10 + first.name.length() + 32 && issued[0] == 1 && issued[9] == first.name.length()
+			&& new String(issued, 10, first.name.length(), StandardCharsets.US_ASCII).equals(first.name), issued.length + " bytes");
+		long expiresAt = ByteBuffer.wrap(issued, 1, 8).getLong();
+		long now = System.currentTimeMillis() / 1000;
+		check("the ticket expires soon", expiresAt > now && expiresAt < now + 3600, (expiresAt - now) + " s from now");
+		// The turn may have come while the others were still joining. A player who
+		// joined after that was never told about the first one, which shows the
+		// same thing: the first one, who had joined, was no longer there.
+		boolean sawFirst = second.timesListed(first.name) > 0;
+		check("the transferred player leaves the limbo", !sawFirst || (second.sawChat(first.name + " left")
+			&& second.awaitPacket(ClientboundRemoveEntitiesPacket.class, p -> p.entityIds().contains(first.entityId))),
+			sawFirst ? "seen leaving" : "already gone when the last in line joined");
+		check("the others move up the line", second.sawActionBar("Place in queue: 1 of 1", 20000) && middle.transfer != null,
+			second.received(ClientboundSystemChatPacket.class).stream().filter(ClientboundSystemChatPacket::overlay).map(p -> p.content().getString()).distinct().toList());
+
+		// ---- the destination ----
+		String to = first.transfer.host();
+		int toPort = first.transfer.port();
+		Client arrived = arrive(to, toPort, first.name, ClientIntent.TRANSFER, issued, Cookies.ANSWER, null);
+		check("the transferred player gets into the destination with the ticket", arrived.entityId >= 0 && arrived.error == null, arrived.error);
+		if (arrived.entityId < 0) return;
+		check("the destination asked for the ticket during login", arrived.cookieRequests.contains("login"), arrived.cookieRequests);
+
+		Client direct = arrive(to, toPort, "q3_" + suffix, ClientIntent.LOGIN, null, Cookies.ANSWER, arrived);
+		refused("a player who did not come by transfer", direct, "only reachable through its queue", arrived);
+		Client none = arrive(to, toPort, "q4_" + suffix, ClientIntent.TRANSFER, null, Cookies.ANSWER, arrived);
+		refused("a player without a ticket", none, "no queue ticket", arrived);
+		byte[] tampered = issued.clone();
+		tampered[8]++; // a later expiry
+		Client forged = arrive(to, toPort, first.name, ClientIntent.TRANSFER, tampered, Cookies.ANSWER, arrived);
+		refused("a tampered ticket", forged, "not valid", arrived);
+		Client borrowed = arrive(to, toPort, "q5_" + suffix, ClientIntent.TRANSFER, issued, Cookies.ANSWER, arrived);
+		refused("a ticket issued to another name", borrowed, "not valid", arrived);
+		Client late = arrive(to, toPort, "q6_" + suffix, ClientIntent.TRANSFER, ticket(secret, "q6_" + suffix, now - 5), Cookies.ANSWER, arrived);
+		refused("an expired ticket", late, "expired", arrived);
+		Client silent = arrive(to, toPort, "q7_" + suffix, ClientIntent.TRANSFER, ticket(secret, "q7_" + suffix, now + 60), Cookies.SILENT, arrived);
+		refused("a client that never answers the cookie request", silent, "could not check", arrived);
+
+		Client noisy = arrive(to, toPort, "q8_" + suffix, ClientIntent.TRANSFER, ticket(secret, "q8_" + suffix, now + 60), Cookies.NOISY, arrived);
+		check("a ticket made from the documented layout is let in, past unasked and repeated answers", noisy.entityId >= 0 && noisy.error == null, noisy.error);
+		check("the others see the player let in", arrived.sawChat(noisy.name + " joined"));
+		Thread.sleep(500);
+
+		for (Client client : List.of(first, middle, second, arrived, noisy)) check("nothing " + client.name + " received was unreadable", client.error == null, client.error);
+		Map<String, Integer> seen = new java.util.TreeMap<>();
+		for (Client client : List.of(first, middle, second, arrived, noisy, direct, none, forged, borrowed, late, silent)) client.counts.forEach((type, count) -> seen.merge(type, count, Integer::sum));
+		say("\nPacket types decoded: " + seen.size());
+		seen.forEach((type, count) -> say("  " + count + " x " + type));
+		second.quit();
+		arrived.quit();
+		noisy.quit();
 	}
 
 	/** A line of a sign's front text, read with the game's own codec for sign text. */

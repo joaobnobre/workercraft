@@ -1,0 +1,17 @@
+{
+	"$schema": "../../node_modules/wrangler/config-schema.json",
+	"name": "workercraft-plugin-limbo",
+	"main": "index.ts",
+	"compatibility_date": "2026-11-08",
+	// Reached only through the world's service binding, so no public URL.
+	"workers_dev": false,
+	"preview_urls": false,
+	// QUEUE_SECRET, shared with the destination, goes in .dev.vars beside this
+	// file (see .dev.vars.example), or `wrangler secret put` when deployed.
+	"vars": {
+		// Where players go when their turn comes: the gate example on INSTANCE=2.
+		"DESTINATION": "localhost:25572",
+		"ADMIT_EVERY_SECONDS": "5",
+		"TICKET_TTL_SECONDS": "60"
+	}
+}

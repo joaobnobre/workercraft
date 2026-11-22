@@ -1,0 +1,15 @@
+{
+	"$schema": "../../node_modules/wrangler/config-schema.json",
+	"name": "workercraft-plugin-gate",
+	"main": "index.ts",
+	"compatibility_date": "2026-11-08",
+	// Reached only through the world's service binding, so no public URL.
+	"workers_dev": false,
+	"preview_urls": false,
+	// QUEUE_SECRET, shared with the limbo, goes in .dev.vars beside this file
+	// (see .dev.vars.example), or `wrangler secret put` when deployed.
+	"vars": {
+		// Named to the players this turns away: the limbo example on INSTANCE=1.
+		"QUEUE_ADDRESS": "localhost:25571"
+	}
+}
