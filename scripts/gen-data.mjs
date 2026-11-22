@@ -260,6 +260,103 @@ for (const [name, block] of Object.entries(blocksReport)) {
 }
 blockDefs.sort((a, b) => a[1] - b[1]);
 
+// What each block state offers to blocks resting on it (see faces() in
+// Probe.java). There are few distinct answers, so each is stored once in
+// faceMasks. Each block, in blockDefs order, names the one all its states
+// share, or else, as -1 - i, the i-th entry of faceTables, which blocks of
+// the same shape share. Such an entry is [properties, answers, runs]: the
+// indices of the properties the answer depends on, the faceMasks it uses, and
+// one answer for each combination of those properties' values (numbered the
+// way states are), as a run-length string: FACE_ALPHABET[i] for the i-th of
+// its answers, then how many in a row have it when that is more than one.
+//
+// The fluid in a state is not stored per state: it follows from the block
+// (water, lava, and the few blocks that are always under water) and from a
+// waterlogged property, which is checked here against what the probe says.
+const FACE_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const FLUID_SHIFT = 29;
+const faceMasks = [];
+const faceIndex = new Map();
+const faceTables = [];
+const faceTableIndex = new Map();
+const alwaysWater = [];
+const blockFaces = blockDefs.map(([name, , , , , properties]) => {
+	const probed = probe.blocks[name].faces;
+	const sizes = properties.map(([, values]) => values.length);
+	if (probed.length !== sizes.reduce((n, size) => n * size, 1)) throw new Error(`The probe reported the wrong number of states for ${name}`);
+	// Value index of each property, for state number i of this block.
+	const valuesOf = (i) => {
+		const out = [];
+		for (let p = sizes.length - 1; p >= 0; p--) {
+			out[p] = i % sizes[p];
+			i = Math.floor(i / sizes[p]);
+		}
+		return out;
+	};
+	const fluids = probed.map((mask) => mask >>> FLUID_SHIFT);
+	const waterlogged = properties.findIndex(([property]) => property === "waterlogged");
+	const level = properties.findIndex(([property]) => property === "level");
+	if (fluids.every((fluid) => fluid === 1) && waterlogged < 0) alwaysWater.push(name);
+	fluids.forEach((fluid, i) => {
+		const values = valuesOf(i);
+		let expected = 0;
+		if (name === "water") expected = values[level] === 0 ? 1 : 2;
+		else if (name === "lava") expected = 3;
+		else if (alwaysWater.includes(name) || (waterlogged >= 0 && properties[waterlogged][1][values[waterlogged]] === "true")) expected = 1;
+		if (fluid !== expected) throw new Error(`The fluid in ${name} is not what the server works out`);
+	});
+	const masks = probed.map((mask) => mask & ((1 << FLUID_SHIFT) - 1));
+	const indices = masks.map((mask) => {
+		if (!faceIndex.has(mask)) faceIndex.set(mask, faceMasks.push(mask) - 1);
+		return faceIndex.get(mask);
+	});
+	if (indices.every((index) => index === indices[0])) return indices[0];
+	// The properties the answer depends on.
+	const relevant = sizes
+		.map((_, p) => p)
+		.filter((p) => indices.some((index, i) => {
+			const values = valuesOf(i);
+			if (values[p] !== 0) return false;
+			let stride = 1;
+			for (let q = p + 1; q < sizes.length; q++) stride *= sizes[q];
+			for (let v = 1; v < sizes[p]; v++) if (indices[i + v * stride] !== index) return true;
+			return false;
+		}));
+	const table = [];
+	indices.forEach((index, i) => {
+		const values = valuesOf(i);
+		let slot = 0;
+		for (const p of relevant) slot = slot * sizes[p] + values[p];
+		if (table[slot] !== undefined && table[slot] !== index) throw new Error(`Face masks of ${name} depend on more than the properties found`);
+		table[slot] = index;
+	});
+	const used = [...new Set(table)];
+	if (used.length > FACE_ALPHABET.length) throw new Error(`${name} has too many different face masks`);
+	let runs = "";
+	for (let i = 0; i < table.length; ) {
+		let run = 1;
+		while (table[i + run] === table[i]) run++;
+		runs += FACE_ALPHABET[used.indexOf(table[i])] + (run > 1 ? run : "");
+		i += run;
+	}
+	const key = JSON.stringify([relevant, used, runs]);
+	if (!faceTableIndex.has(key)) faceTableIndex.set(key, faceTables.push([relevant, used, runs]) - 1);
+	return -1 - faceTableIndex.get(key);
+});
+
+// Which of the game's classes decide whether a block can stay where it is,
+// grouped: [canSurvive class, mayPlaceOn class, the tags the block was built
+// with by field name, growth direction, blocks]. Classes are spelled like a block's kind.
+const survivalGroups = new Map();
+for (const [name] of blockDefs) {
+	const { survive, mayPlaceOn, tags: supportTags, growth } = probe.blocks[name];
+	if (!survive) continue;
+	const key = JSON.stringify([blockKind(survive), mayPlaceOn ? blockKind(mayPlaceOn) : null, supportTags ?? {}, growth ?? null]);
+	if (!survivalGroups.has(key)) survivalGroups.set(key, [...JSON.parse(key), []]);
+	survivalGroups.get(key)[4].push(name);
+}
+const survival = [...survivalGroups.values()];
+
 const SOUNDS = [
 	"block.wooden_door.open", "block.wooden_door.close", "block.iron_door.open", "block.iron_door.close",
 	"block.copper_door.open", "block.copper_door.close", "block.wooden_trapdoor.open", "block.wooden_trapdoor.close",
@@ -319,6 +416,12 @@ const out = {
 	blockEntities,
 	passable,
 	fullCubes,
+	faceMasks,
+	faceTables,
+	blockFaces,
+	survival,
+	alwaysWater,
+	fluids: Object.fromEntries(["water", "flowing_water", "lava"].map((name) => [name, registriesReport["minecraft:fluid"].entries[`minecraft:${name}`].protocol_id])),
 	soundGroups,
 	entityData,
 	sounds,

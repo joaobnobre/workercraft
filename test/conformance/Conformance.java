@@ -29,6 +29,8 @@ import io.netty.buffer.Unpooled;
 import java.io.DataInputStream;
 import java.io.EOFException;
 import java.io.OutputStream;
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.Proxy;
 import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -76,6 +78,7 @@ import net.minecraft.network.protocol.cookie.ClientboundCookieRequestPacket;
 import net.minecraft.network.protocol.cookie.ServerboundCookieResponsePacket;
 import net.minecraft.network.protocol.game.ClientboundAddEntityPacket;
 import net.minecraft.network.protocol.game.ClientboundBlockEntityDataPacket;
+import net.minecraft.network.protocol.game.ClientboundBlockChangedAckPacket;
 import net.minecraft.network.protocol.game.ClientboundBlockUpdatePacket;
 import net.minecraft.network.protocol.game.ClientboundChunkBatchFinishedPacket;
 import net.minecraft.network.protocol.game.ClientboundContainerSetSlotPacket;
@@ -144,7 +147,10 @@ import net.minecraft.world.item.Items;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.entity.SignText;
 import net.minecraft.world.level.block.entity.SignTextSlot;
+import net.minecraft.world.level.LevelReader;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.properties.AttachFace;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.block.state.properties.Property;
 import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.chunk.PalettedContainerFactory;
@@ -722,6 +728,9 @@ public class Conformance {
 		bob.send(new ServerboundPickItemFromBlockPacket(stairs, false));
 		check("middle click gives the block's item", until(() -> bob.inventory.values().stream().anyMatch(stack -> stack.is(Items.OAK_STAIRS))), bob.inventory);
 
+		support(alice, baseX, baseZ);
+		alice.moveTo(baseX + 0.5, -60, baseZ + 0.5, 180, 0);
+
 		// ---- leaving and coming back ----
 		alice.hold(Items.DIAMOND_SWORD);
 		check("others see the item in hand change",
@@ -872,6 +881,278 @@ public class Conformance {
 		second.quit();
 		arrived.quit();
 		noisy.quit();
+	}
+
+	// ---- what blocks can rest on ----
+
+	/**
+	 * The world as a client sees it, for asking the game's own rules about it:
+	 * the game's canSurvive is run on it, so the expected answers come from
+	 * the game, not from this file. Light is full and there are no block entities.
+	 */
+	static LevelReader view(Client client) {
+		return (LevelReader) Proxy.newProxyInstance(LevelReader.class.getClassLoader(), new Class<?>[] { LevelReader.class }, (proxy, method, args) -> {
+			switch (method.getName()) {
+				case "getBlockState":
+					return seen(client, (BlockPos) args[0]);
+				case "getFluidState":
+					return seen(client, (BlockPos) args[0]).getFluidState();
+				case "getBlockEntity":
+					return null;
+				case "getMinY":
+					return MIN_Y;
+				case "getHeight":
+					if (args == null || args.length == 0) return SECTIONS * 16;
+					break;
+				case "isClientSide":
+					return false;
+				case "getRawBrightness":
+				case "getMaxLocalRawBrightness":
+					return 15;
+				case "hashCode":
+					return System.identityHashCode(proxy);
+				case "equals":
+					return proxy == args[0];
+				case "toString":
+					return "the world as " + client.name + " sees it";
+			}
+			if (method.isDefault()) return InvocationHandler.invokeDefault(proxy, method, args);
+			throw new UnsupportedOperationException("LevelReader." + method.getName());
+		});
+	}
+
+	static BlockState seen(Client client, BlockPos pos) {
+		BlockState state = client.block(pos.immutable());
+		return state == null ? Blocks.AIR.defaultBlockState() : state;
+	}
+
+	/** Clicks with an item and waits for the server to acknowledge the click. Returns where in the client's packets the answer starts. */
+	static int use(Client client, Item item, BlockPos clicked, Direction face, double height) throws Exception {
+		if (item != null) client.hold(item);
+		int start = client.packets.size();
+		int sequence = client.sequence;
+		client.click(clicked, face, height);
+		until(() -> client.received(ClientboundBlockChangedAckPacket.class).stream().anyMatch(p -> p.sequence() >= sequence));
+		return start;
+	}
+
+	static int use(Client client, Item item, BlockPos clicked, Direction face) throws Exception {
+		return use(client, item, clicked, face, face == Direction.UP ? 1 : face == Direction.DOWN ? 0 : 0.5);
+	}
+
+	/**
+	 * Places `item` by clicking `face` of `clicked`, and checks that the server
+	 * did what the game would: put the first of `candidates` (the states the
+	 * game tries for this click, in its order) that the game's canSurvive
+	 * accepts, or nothing when it accepts none. `placed` says which of the two
+	 * this case is meant to show. A refused click must be corrected on the
+	 * client: an update for the block it guessed, before the acknowledgement.
+	 */
+	static void placement(String label, boolean placed, Client client, Item item, BlockPos clicked, Direction face, double height, BlockPos target, BlockState... candidates) throws Exception {
+		LevelReader level = view(client);
+		BlockState before = seen(client, target);
+		BlockState expected = null;
+		List<String> answers = new ArrayList<>();
+		for (BlockState candidate : candidates) {
+			boolean survives = candidate.canSurvive(level, target);
+			answers.add(candidate + (survives ? " can stay" : " cannot stay"));
+			if (survives && expected == null) expected = candidate;
+		}
+		int start = use(client, item, clicked, face, height);
+		BlockState actual = seen(client, target);
+		String detail = "server: " + actual + "; game: " + String.join(", ", answers);
+		if (expected != null) {
+			check(label + (placed ? "" : " (the game allows it, expected otherwise)"), placed && actual.equals(expected), detail);
+			return;
+		}
+		boolean corrected = false;
+		List<Packet<?>> answer = client.packets.subList(start, client.packets.size());
+		for (Packet<?> packet : answer) {
+			if (packet instanceof ClientboundBlockUpdatePacket update && update.getPos().equals(target) && update.getBlockState().equals(before)) corrected = true;
+			if (packet instanceof ClientboundBlockChangedAckPacket) break;
+		}
+		check(label + (placed ? " (the game refuses it, expected otherwise)" : ""), !placed && actual.equals(before) && corrected, detail + (corrected ? "" : "; no update for the guessed block before the acknowledgement"));
+	}
+
+	static void placement(String label, boolean placed, Client client, Item item, BlockPos clicked, Direction face, BlockPos target, BlockState... candidates) throws Exception {
+		placement(label, placed, client, item, clicked, face, face == Direction.UP ? 1 : face == Direction.DOWN ? 0 : 0.5, target, candidates);
+	}
+
+	static void sneak(Client client, boolean sneaking) throws Exception {
+		client.send(new ServerboundPlayerInputPacket(new Input(false, false, false, false, false, sneaking, false)));
+		Thread.sleep(100);
+	}
+
+	static BlockState facing(net.minecraft.world.level.block.Block block, Direction facing) {
+		return block.defaultBlockState().setValue(BlockStateProperties.HORIZONTAL_FACING, facing);
+	}
+
+	static BlockState[] torches(Direction wall) {
+		return new BlockState[] { facing(Blocks.WALL_TORCH, wall), Blocks.TORCH.defaultBlockState() };
+	}
+
+	/**
+	 * What a torch, a flower, a lantern and the rest may be put on, and what
+	 * they fall off. Each case gets a column of its own, south of which the
+	 * builder stands looking north.
+	 */
+	static void support(Client alice, int baseX, int baseZ) throws Exception {
+		int[] next = { 0 };
+		java.util.function.Supplier<BlockPos> column = () -> {
+			int i = next[0]++;
+			return new BlockPos(baseX + 16 + 4 * (i % 8), -60, baseZ + 16 + 8 * (i / 8));
+		};
+		java.util.function.Function<BlockPos, BlockPos> standBy = (at) -> {
+			try {
+				alice.moveTo(at.getX() + 0.5, -60, at.getZ() + 3.5, 180, 20);
+				until(() -> alice.block(at) != null && alice.block(at.offset(1, 0, 1)) != null);
+				Thread.sleep(100);
+			} catch (Exception e) {
+				throw new RuntimeException(e);
+			}
+			return at;
+		};
+		// A column: stone on the ground, and `top` on that.
+		java.util.function.BiFunction<Item, BlockPos, BlockPos> pillar = (top, at) -> {
+			try {
+				use(alice, Items.STONE, at.below(), Direction.UP);
+				if (top != null) use(alice, top, at, Direction.UP);
+			} catch (Exception e) {
+				throw new RuntimeException(e);
+			}
+			return at.above();
+		};
+		Direction S = Direction.SOUTH;
+
+		BlockPos at = standBy.apply(column.get());
+		BlockPos fence = pillar.apply(Items.OAK_FENCE, at);
+		placement("a torch stands on a fence post", true, alice, Items.TORCH, fence, Direction.UP, fence.above(), Blocks.TORCH.defaultBlockState());
+		placement("a torch does not go on the side of a fence", false, alice, Items.TORCH, fence, S, fence.south(), torches(S));
+		placement("a ladder does not go on the side of a fence", false, alice, Items.LADDER, fence, Direction.EAST, fence.east(), facing(Blocks.LADDER, Direction.EAST));
+
+		at = standBy.apply(column.get());
+		BlockPos pane = pillar.apply(Items.GLASS_PANE, at);
+		placement("a torch stands on a glass pane", true, alice, Items.TORCH, pane, Direction.UP, pane.above(), Blocks.TORCH.defaultBlockState());
+		placement("a torch does not go on the side of a glass pane", false, alice, Items.TORCH, pane, S, pane.south(), torches(S));
+		placement("a button does not go on the side of a glass pane", false, alice, Items.STONE_BUTTON, pane, Direction.EAST, pane.east(),
+			facing(Blocks.STONE_BUTTON, Direction.EAST).setValue(BlockStateProperties.ATTACH_FACE, AttachFace.WALL),
+			facing(Blocks.STONE_BUTTON, Direction.NORTH).setValue(BlockStateProperties.ATTACH_FACE, AttachFace.FLOOR));
+
+		at = standBy.apply(column.get());
+		BlockPos slab = pillar.apply(Items.OAK_SLAB, at);
+		placement("a torch does not go on the missing half of a slab's side", false, alice, Items.TORCH, slab, S, 0.75, slab.south(), torches(S));
+		placement("a torch does not stand on a bottom slab", false, alice, Items.TORCH, slab, Direction.UP, slab.above(), Blocks.TORCH.defaultBlockState());
+		placement("redstone dust does not go on a bottom slab", false, alice, Items.REDSTONE, slab, Direction.UP, slab.above(), Blocks.REDSTONE_WIRE.defaultBlockState());
+		placement("a repeater does not go on a bottom slab", false, alice, Items.REPEATER, slab, Direction.UP, slab.above(), facing(Blocks.REPEATER, Direction.SOUTH));
+		BlockPos stone = slab.below();
+		placement("a torch goes on the side of a full block", true, alice, Items.TORCH, stone, S, stone.south(), torches(S));
+		use(alice, Items.STONE, stone.south().east().below(), Direction.UP);
+		check("a torch stays when a block is put next to it", is(seen(alice, stone.south()), Blocks.WALL_TORCH, "facing=south"), alice.describe(stone.south()));
+
+		at = standBy.apply(column.get());
+		use(alice, Items.STONE, at.below(), Direction.UP);
+		use(alice, Items.OAK_SLAB, at, S, 0.75);
+		BlockPos topSlab = at.south();
+		check("a slab put on the upper half of a side is a top slab", is(seen(alice, topSlab), Blocks.OAK_SLAB, "type=top"), alice.describe(topSlab));
+		placement("a torch stands on a top slab", true, alice, Items.TORCH, topSlab, Direction.UP, topSlab.above(), Blocks.TORCH.defaultBlockState());
+		use(alice, Items.STONE_BRICK_STAIRS, at, Direction.EAST, 0.75);
+		BlockPos stairs = at.east();
+		check("stairs put on the upper half of a side are upside down", is(seen(alice, stairs), Blocks.STONE_BRICK_STAIRS, "half=top"), alice.describe(stairs));
+		placement("a torch stands on upside-down stairs", true, alice, Items.TORCH, stairs, Direction.UP, stairs.above(), Blocks.TORCH.defaultBlockState());
+		use(alice, Items.OAK_SLAB, at, Direction.WEST, 0.75);
+		placement("redstone dust goes on a top slab", true, alice, Items.REDSTONE, at.west(), Direction.UP, at.west().above(), Blocks.REDSTONE_WIRE.defaultBlockState());
+
+		at = standBy.apply(column.get());
+		BlockPos bare = pillar.apply(null, at).below();
+		placement("a flower does not grow on stone", false, alice, Items.POPPY, bare, Direction.UP, bare.above(), Blocks.POPPY.defaultBlockState());
+		placement("a flower grows on grass", true, alice, Items.POPPY, bare.east().below(), Direction.UP, bare.east(), Blocks.POPPY.defaultBlockState());
+
+		at = standBy.apply(column.get());
+		BlockPos wall = pillar.apply(Items.COBBLESTONE_WALL, at);
+		placement("a torch stands on a wall", true, alice, Items.TORCH, wall, Direction.UP, wall.above(), Blocks.TORCH.defaultBlockState());
+
+		at = standBy.apply(column.get());
+		BlockPos glass = pillar.apply(Items.GLASS, at);
+		placement("a ladder goes on glass", true, alice, Items.LADDER, glass, S, glass.south(), facing(Blocks.LADDER, S));
+
+		at = standBy.apply(column.get());
+		BlockPos fence2 = pillar.apply(Items.OAK_FENCE, at);
+		placement("a rail does not go on a fence post", false, alice, Items.RAIL, fence2, Direction.UP, fence2.above(), Blocks.RAIL.defaultBlockState());
+		placement("a door does not stand on a fence", false, alice, Items.OAK_DOOR, fence2, Direction.UP, fence2.above(), Blocks.OAK_DOOR.defaultBlockState());
+		placement("a pressure plate goes on a fence post", true, alice, Items.STONE_PRESSURE_PLATE, fence2, Direction.UP, fence2.above(), Blocks.STONE_PRESSURE_PLATE.defaultBlockState());
+
+		// Hanging things: a block sticking out over two blocks of air.
+		at = standBy.apply(column.get());
+		use(alice, Items.STONE, at.below(), Direction.UP);
+		use(alice, Items.STONE, at, Direction.UP);
+		use(alice, Items.STONE, at.above(), Direction.UP);
+		BlockPos top = at.above(2);
+		use(alice, Items.STONE, top, S);
+		BlockPos over = top.south();
+		use(alice, Items.IRON_CHAIN, over, Direction.DOWN);
+		check("a chain hangs under a block", is(seen(alice, over.below()), Blocks.IRON_CHAIN, "axis=y"), alice.describe(over.below()));
+		placement("a lantern hangs under a chain", true, alice, Items.LANTERN, over.below(), Direction.DOWN, over.below(2),
+			Blocks.LANTERN.defaultBlockState().setValue(BlockStateProperties.HANGING, true));
+		use(alice, Items.OAK_FENCE, top, Direction.EAST);
+		BlockPos overFence = top.east();
+		placement("a lantern hangs under a fence", true, alice, Items.LANTERN, overFence, Direction.DOWN, overFence.below(),
+			Blocks.LANTERN.defaultBlockState().setValue(BlockStateProperties.HANGING, true));
+		use(alice, Items.GLASS_PANE, top, Direction.WEST);
+		BlockPos overPane = top.west();
+		placement("a hanging sign hangs under a glass pane", true, alice, Items.OAK_HANGING_SIGN, overPane, Direction.DOWN, overPane.below(),
+			Blocks.OAK_HANGING_SIGN.defaultBlockState().setValue(BlockStateProperties.ATTACHED, true).setValue(BlockStateProperties.ROTATION_16, 0));
+		// Placing a sign opens its editor; close it by sending the text unchanged.
+		alice.send(new ServerboundSignUpdatePacket(overPane.below(), List.of("", "", "", ""), SignTextSlot.FRONT));
+
+		// Plants that need something particular next to them.
+		at = standBy.apply(column.get());
+		BlockPos sand = pillar.apply(Items.SAND, at);
+		placement("sugar cane does not grow on sand without water", false, alice, Items.SUGAR_CANE, sand, Direction.UP, sand.above(), Blocks.SUGAR_CANE.defaultBlockState());
+		use(alice, Items.WATER_BUCKET, sand, Direction.EAST);
+		placement("sugar cane grows on sand next to water", true, alice, Items.SUGAR_CANE, sand, Direction.UP, sand.above(), Blocks.SUGAR_CANE.defaultBlockState());
+		// Sand on the ground west of the column: a cactus on it would have the column's sand beside it.
+		BlockPos crowded = sand.west();
+		use(alice, Items.SAND, crowded.below(2), Direction.UP);
+		placement("a cactus does not grow next to a block", false, alice, Items.CACTUS, crowded.below(), Direction.UP, crowded, Blocks.CACTUS.defaultBlockState());
+		BlockPos cactus = crowded.south();
+		use(alice, Items.SAND, cactus.below(2), Direction.UP);
+		placement("a cactus grows on sand with room around it", true, alice, Items.CACTUS, cactus.below(), Direction.UP, cactus, Blocks.CACTUS.defaultBlockState());
+		use(alice, Items.STONE, cactus.south().below(2), Direction.UP);
+		use(alice, Items.STONE, cactus.south().below(), Direction.UP);
+		check("a cactus breaks when a block is put next to it", is(seen(alice, cactus), Blocks.AIR), alice.describe(cactus) + ", game: " + Blocks.CACTUS.defaultBlockState().canSurvive(view(alice), cactus));
+
+		// Falling off when what holds it changes to something that no longer does.
+		at = standBy.apply(column.get());
+		BlockPos base = pillar.apply(null, at).below();
+		use(alice, Items.OAK_TRAPDOOR, base, S, 0.75);
+		BlockPos trapdoor = base.south();
+		check("a trapdoor put on the upper half of a side is a top trapdoor", is(seen(alice, trapdoor), Blocks.OAK_TRAPDOOR, "half=top", "open=false"), alice.describe(trapdoor));
+		// A click on a trapdoor opens it, so the player sneaks to put something on it, as in the game.
+		sneak(alice, true);
+		placement("a torch stands on a closed top trapdoor", true, alice, Items.TORCH, trapdoor, Direction.UP, trapdoor.above(), Blocks.TORCH.defaultBlockState());
+		sneak(alice, false);
+		use(alice, null, trapdoor, S);
+		BlockState torchAfter = seen(alice, trapdoor.above());
+		check("opening the trapdoor drops the torch on it", is(seen(alice, trapdoor), Blocks.OAK_TRAPDOOR, "open=true") && torchAfter.isAir(),
+			alice.describe(trapdoor) + " / " + torchAfter + ", game: " + Blocks.TORCH.defaultBlockState().canSurvive(view(alice), trapdoor.above()));
+
+		at = standBy.apply(column.get());
+		use(alice, Items.STONE, at.below(), Direction.UP);
+		use(alice, Items.STONE, at, Direction.UP);
+		use(alice, Items.OAK_TRAPDOOR, at.above(), S, 0.25);
+		BlockPos low = at.above().south();
+		BlockState hanging = Blocks.LANTERN.defaultBlockState().setValue(BlockStateProperties.HANGING, true);
+		sneak(alice, true);
+		placement("a lantern hangs under a closed bottom trapdoor", true, alice, Items.LANTERN, low, Direction.DOWN, low.below(), hanging);
+		sneak(alice, false);
+		use(alice, null, low, S);
+		check("opening the trapdoor drops the lantern under it", seen(alice, low.below()).isAir(), alice.describe(low.below()) + ", game: " + hanging.canSurvive(view(alice), low.below()));
+
+		at = standBy.apply(column.get());
+		BlockPos glass2 = pillar.apply(Items.GLASS, at);
+		placement("a vine grows on glass", true, alice, Items.VINE, glass2, S, glass2.south(), Blocks.VINE.defaultBlockState().setValue(BlockStateProperties.NORTH, true));
+		alice.breakBlock(glass2);
+		check("a vine falls when its block is broken", until(() -> seen(alice, glass2.south()).isAir()), alice.describe(glass2.south()));
 	}
 
 	/** A line of a sign's front text, read with the game's own codec for sign text. */

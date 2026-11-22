@@ -665,8 +665,8 @@ export class World extends DurableObject<Env> {
 
 	/**
 	 * Changes blocks, then lets the surroundings react: fences and stairs take
-	 * their new shape, and whatever was attached to a block that is gone falls
-	 * off, which can in turn free something else.
+	 * their new shape, and whatever can no longer stay next to a changed block
+	 * falls off, which can in turn free something else.
 	 */
 	changeBlocks(changes: BlockChange[], effectsExcept?: Player): void {
 		this.settle(changes.filter((change) => this.changeBlock(change.x, change.y, change.z, change.state, effectsExcept)));
@@ -679,7 +679,8 @@ export class World extends DurableObject<Env> {
 			const at = queue[next]!;
 			for (const [dx, dy, dz] of [[0, 0, 0], ...Object.values(OFFSET)] as const) {
 				const position = { x: at.x + dx, y: at.y + dy, z: at.z + dz };
-				this.changeBlock(position.x, position.y, position.z, reshape(this.getBlock, position));
+				// A block that took a new shape may no longer hold what rests on it.
+				if (this.changeBlock(position.x, position.y, position.z, reshape(this.getBlock, position)) && (dx || dy || dz)) queue.push(position);
 			}
 			for (const loose of unsupportedAround(this.getBlock, at)) queue.push(...this.removeBlock(loose));
 		}
@@ -773,7 +774,7 @@ export class World extends DurableObject<Env> {
 		}
 
 		if (heldName === undefined) return false;
-		const placement = { getBlock: this.getBlock, item: heldName, clicked, face, cursor, yaw: player.yaw, pitch: player.pitch, minY: MIN_Y, maxY: MAX_Y };
+		const placement = { getBlock: this.getBlock, item: heldName, clicked, face, cursor, yaw: player.yaw, pitch: player.pitch, minY: MIN_Y, maxY: MAX_Y, sneaking: player.sneaking };
 		const planned = place(placement);
 		const target = planned?.[0];
 		if (!target) return false;

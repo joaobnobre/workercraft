@@ -6,6 +6,7 @@
 // functions over "what block is at x, y, z"; world.ts applies the results.
 
 import {
+	DIRECTIONS,
 	OFFSET,
 	OPPOSITE,
 	HORIZONTAL,
@@ -27,6 +28,17 @@ import {
 	type Direction,
 	type Properties,
 } from "./blockstates";
+import {
+	canSurvive,
+	collisionBottomFull,
+	hasWaterSource,
+	isFaceSturdy,
+	multifaceCanAttach,
+	needsWaterToPlace,
+	updatedMultiface,
+	updatedVine,
+	vineCanAttach,
+} from "./survival";
 
 export type GetBlock = (x: number, y: number, z: number) => number;
 
@@ -41,7 +53,6 @@ export interface BlockChange extends Position {
 }
 
 const AIR = 0;
-const WATER_SOURCE = blockByName("water")?.defaultState;
 
 function offset(at: Position, direction: Direction, distance = 1): Position {
 	const [dx, dy, dz] = OFFSET[direction];
@@ -110,10 +121,12 @@ export interface Placement {
 	pitch: number;
 	minY: number;
 	maxY: number;
+	/** Sneaking, which the game calls using the item's secondary action. */
+	sneaking?: boolean;
 }
 
 /** Block classes whose "facing" is the face they were placed against. */
-const FACES_CLICKED_SIDE = new Set(["ladder", "trip_wire_hook", "end_rod", "lightning_rod", "weathering_lightning_rod", "amethyst_cluster", "shulker_box"]);
+const FACES_CLICKED_SIDE = new Set(["end_rod", "lightning_rod", "weathering_lightning_rod", "amethyst_cluster", "shulker_box"]);
 /** Block classes that face the way the player looks. Most others face the player instead. */
 const FACES_AWAY = new Set(["stair", "weathering_copper_stair", "door", "weathering_copper_door", "fence_gate", "bed", "straw_bed", "campfire"]);
 /** Properties that count how many of the block share one space: candles, sea pickles, snow layers. */
@@ -146,61 +159,231 @@ function stackOnto(state: number, def: BlockDef, placement?: Pick<Placement, "fa
 }
 
 /**
- * Every block change that placing this item causes, or nothing when it cannot
- * be placed there. Doors, beds and tall plants are two blocks.
+ * The six directions, nearest to where the player looks first: vanilla's
+ * Direction.orderedByNearest, with the block that was clicked moved to the
+ * front unless the click replaces it (BlockPlaceContext.getNearestLookingDirections).
+ * Blocks that can hang on several sides take the first of these that holds them.
  */
-export function place(p: Placement): BlockChange[] | undefined {
-	let def = blockForItem(p.item);
-	if (!def) return undefined;
-	const get = (at: Position) => p.getBlock(at.x, at.y, at.z);
+function nearestLookingDirections(yaw: number, pitch: number, face: Direction, replacingClicked: boolean): Direction[] {
+	const pitchRadians = (pitch * Math.PI) / 180;
+	const yawRadians = (-yaw * Math.PI) / 180;
+	const [sinPitch, cosPitch, sinYaw, cosYaw] = [Math.sin(pitchRadians), Math.cos(pitchRadians), Math.sin(yawRadians), Math.cos(yawRadians)];
+	const [east, up, south] = [sinYaw > 0, sinPitch < 0, cosYaw > 0];
+	const x = east ? sinYaw : -sinYaw;
+	const y = up ? -sinPitch : sinPitch;
+	const z = south ? cosYaw : -cosYaw;
+	const [xLevel, zLevel] = [x * cosPitch, z * cosPitch];
+	const alongX: Direction = east ? "east" : "west";
+	const alongY: Direction = up ? "up" : "down";
+	const alongZ: Direction = south ? "south" : "north";
+	let order: [Direction, Direction, Direction];
+	if (x > z) order = y > xLevel ? [alongY, alongX, alongZ] : zLevel > y ? [alongX, alongZ, alongY] : [alongX, alongY, alongZ];
+	else order = y > zLevel ? [alongY, alongZ, alongX] : xLevel > y ? [alongZ, alongX, alongY] : [alongZ, alongY, alongX];
+	const all = [...order, ...order.map((direction) => OPPOSITE[direction]).reverse()];
+	if (replacingClicked) return all;
+	return [OPPOSITE[face], ...all.filter((direction) => direction !== OPPOSITE[face])];
+}
 
-	const clickedState = get(p.clicked);
-	if (blockOf(clickedState) === def) {
-		const stacked = stackOnto(clickedState, def, p);
-		if (stacked !== undefined) return [{ ...p.clicked, state: stacked }];
-	}
+const isHorizontal = (direction: Direction) => direction !== "up" && direction !== "down";
 
-	const replacingClicked = isReplaceable(clickedState);
-	const at = replacingClicked ? p.clicked : offset(p.clicked, p.face);
-	if (at.y < p.minY || at.y > p.maxY) return undefined;
-	const existing = get(at);
-	if (!replacingClicked && blockOf(existing) === def) {
-		const stacked = stackOnto(existing, def);
-		if (stacked !== undefined) return [{ ...at, state: stacked }];
-	}
-	if (!isReplaceable(existing)) return undefined;
+/** What a placement knows besides the item: where the block goes and which ways it could hang. */
+interface PlaceContext {
+	p: Placement;
+	at: Position;
+	/** What is at `at` now: air, or something the block replaces. */
+	existing: number;
+	replacingClicked: boolean;
+	directions: Direction[];
+	/** The compass direction the player looks in. */
+	looking: Direction;
+}
 
-	const looking = horizontalFacing(p.yaw);
-	const sideways = p.face !== "up" && p.face !== "down";
-	const upperHalf = p.face === "down" || (sideways && p.cursor.y > 0.5);
-	const set: Properties = {};
+/** A block and the properties a placement rule chose; the rest are filled in by finish(). */
+interface Candidate {
+	def: BlockDef;
+	set: Properties;
+	/** A further check besides canSurvive, as for a wall hanging sign. */
+	check?: (state: number) => boolean;
+}
 
-	// Torches, signs, banners and heads become their wall form on the side of a block.
+/**
+ * The states this placement may end up as, in the order the game tries them.
+ * The first that can stay where it is put is placed; when none can, nothing
+ * is. Most blocks have one candidate; blocks that attach to something try the
+ * sides nearest to where the player looks.
+ */
+function candidates(def: BlockDef, c: PlaceContext): Candidate[] {
+	const { directions, looking } = c;
+	const horizontal = directions.filter(isHorizontal);
+	const facingAway = (each: Direction[]) => each.map((direction) => ({ def, set: { facing: OPPOSITE[direction] } }));
+
+	// Torches, signs, banners, heads and coral fans: standing, or on a wall
+	// (StandingAndWallBlockItem). Hanging signs hang from above or on a wall.
 	const wall = wallForm(def);
 	if (wall) {
-		const hangs = def.type === "ceiling_hanging_sign";
-		if (sideways) {
-			def = wall;
-			set.facing = hangs ? hangingSignFacing(p.face, p.yaw) : p.face;
-		} else if (hangs ? p.face === "up" : p.face === "down") {
-			return undefined; // nothing to stand on, or nothing to hang from
+		const hanging = def.type === "ceiling_hanging_sign";
+		const attachment: Direction = hanging ? "up" : "down";
+		const out: Candidate[] = [];
+		let wallsTried = false;
+		for (const direction of directions) {
+			if (direction === OPPOSITE[attachment]) continue;
+			if (direction === attachment) out.push(hanging ? ceilingHangingSign(def, c) : { def, set: {} });
+			else if (!wallsTried) {
+				wallsTried = true;
+				out.push(...wallCandidates(wall, c));
+			}
+		}
+		return out;
+	}
+	if (hasProperty(def, "face", "ceiling")) {
+		// Buttons, levers and grindstones (FaceAttachedHorizontalDirectionalBlock).
+		return directions.map((direction) =>
+			isHorizontal(direction)
+				? { def, set: { face: "wall", facing: OPPOSITE[direction] } }
+				: { def, set: { face: direction === "up" ? "ceiling" : "floor", facing: looking } },
+		);
+	}
+	switch (def.type) {
+		case "lantern":
+		case "weathering_lantern":
+			return directions.filter((direction) => !isHorizontal(direction)).map((direction) => ({ def, set: { hanging: String(direction === "up") } }));
+		case "ladder": {
+			const clicked = c.p.getBlock(c.p.clicked.x, c.p.clicked.y, c.p.clicked.z);
+			if (!c.replacingClicked && blockOf(clicked) === def && propertiesOf(clicked).facing === c.p.face) return [];
+			return facingAway(horizontal);
+		}
+		case "trip_wire_hook":
+		case "shelf_mushroom":
+			return facingAway(horizontal);
+		case "cocoa":
+			return horizontal.map((direction) => ({ def, set: { facing: direction } }));
+		case "bell":
+			return bellCandidates(def, c);
+		case "vine":
+			return vineCandidate(def, c);
+		case "speleothem":
+		case "pointed_dripstone": {
+			const tip = c.p.pitch < 0 ? "down" : "up"; // away from where the player looks, up or down
+			const property = hasProperty(def, "tip_direction") ? "tip_direction" : "vertical_direction";
+			return [tip, OPPOSITE[tip]].map((each) => ({ def, set: { [property]: each } }));
 		}
 	}
+	if (MULTIFACE.has(def.type) && def.type !== "vine") return multifaceCandidates(def, c);
+	return [{ def, set: {} }];
+}
+
+/** A wall torch, sign or banner faces away from the first wall beside it, nearest to where the player looks, that holds it. */
+function wallCandidates(wall: BlockDef, c: PlaceContext): Candidate[] {
+	const horizontal = c.directions.filter(isHorizontal);
+	if (wall.type === "wall_hanging_sign") {
+		// It hangs along a wall, so it may not face the side that was clicked,
+		// and needs something to hang from on one side or the other.
+		return horizontal
+			.filter((direction) => axisOf(direction) !== axisOf(c.p.face))
+			.map((direction) => {
+				const facing = OPPOSITE[direction];
+				const holds = (side: Direction) => {
+					const next = offset(c.at, side);
+					const state = c.p.getBlock(next.x, next.y, next.z);
+					if (hasTag(blockOf(state), "wall_hanging_signs")) return axisOf(propertiesOf(state).facing as Direction) === axisOf(facing);
+					return isFaceSturdy(state, OPPOSITE[side]);
+				};
+				return { def: wall, set: { facing }, check: () => holds(clockwise(facing)) || holds(counterClockwise(facing)) };
+			});
+	}
+	if (wall.type.includes("wall_skull") || wall.type.includes("wall_head")) {
+		// A head goes on the first side with anything there.
+		const side = horizontal.find((direction) => {
+			const next = offset(c.at, direction);
+			return !isReplaceable(c.p.getBlock(next.x, next.y, next.z));
+		});
+		return side ? [{ def: wall, set: { facing: OPPOSITE[side] } }] : [];
+	}
+	return horizontal.map((direction) => ({ def: wall, set: { facing: OPPOSITE[direction] } }));
+}
+
+/**
+ * A hanging sign under a block. It is "attached" (hangs from one chain in the
+ * middle, and turns freely) unless the block above has a full bottom or is
+ * another hanging sign it lines up with, and always when sneaking.
+ */
+function ceilingHangingSign(def: BlockDef, c: PlaceContext): Candidate {
+	const aboveAt = offset(c.at, "up");
+	const above = c.p.getBlock(aboveAt.x, aboveAt.y, aboveAt.z);
+	const direction = horizontalFacing(c.p.yaw);
+	let attached = !collisionBottomFull(above) || c.p.sneaking === true;
+	if (hasTag(blockOf(above), "all_hanging_signs") && !c.p.sneaking) {
+		const properties = propertiesOf(above);
+		const aboveFacing = properties.facing ?? (properties.rotation !== undefined && Number(properties.rotation) % 4 === 0 ? ROTATION_FACING[Number(properties.rotation) / 4] : undefined);
+		if (aboveFacing !== undefined && axisOf(aboveFacing as Direction) === axisOf(direction)) attached = false;
+	}
+	const rotation = attached ? rotationSegment(c.p.yaw + 180) : rotationSegment(DIRECTION_YAW[OPPOSITE[direction]]);
+	return { def, set: { attached: String(attached), rotation } };
+}
+
+/** The direction each multiple of four rotation segments faces, and the yaw of each direction. */
+const ROTATION_FACING: Direction[] = ["south", "west", "north", "east"];
+const DIRECTION_YAW: Record<Direction, number> = { south: 0, west: 90, north: 180, east: 270, up: 0, down: 0 };
+
+/** A bell on the floor or ceiling, or on the wall that was clicked: between two walls when there is one on each side. */
+function bellCandidates(def: BlockDef, c: PlaceContext): Candidate[] {
+	const face = c.p.face;
+	if (!isHorizontal(face)) return [{ def, set: { attachment: face === "down" ? "ceiling" : "floor", facing: c.looking } }];
+	const sturdyToward = (side: Direction) => {
+		const next = offset(c.at, side);
+		return isFaceSturdy(c.p.getBlock(next.x, next.y, next.z), OPPOSITE[side]);
+	};
+	const between = sturdyToward(face) && sturdyToward(OPPOSITE[face]);
+	const facing = OPPOSITE[face];
+	const belowAt = offset(c.at, "down");
+	const onFloor = isFaceSturdy(c.p.getBlock(belowAt.x, belowAt.y, belowAt.z), "up");
+	return [
+		{ def, set: { facing, attachment: between ? "double_wall" : "single_wall" } },
+		{ def, set: { facing, attachment: onFloor ? "floor" : "ceiling" } },
+	];
+}
+
+/** A vine grows a face towards the first side, nearest to where the player looks, that holds it. */
+function vineCandidate(def: BlockDef, c: PlaceContext): Candidate[] {
+	const base = blockOf(c.existing) === def ? propertiesOf(c.existing) : {};
+	for (const direction of c.directions) {
+		if (direction === "down" || base[direction] === "true") continue;
+		if (vineCanAttach(c.p.getBlock, c.at, direction)) return [{ def, set: { ...base, [direction]: "true" } }];
+	}
+	return [];
+}
+
+/** Glow lichen and the like: a new face on the first side, nearest to where the player looks, with something to cling to. */
+function multifaceCandidates(def: BlockDef, c: PlaceContext): Candidate[] {
+	const base = blockOf(c.existing) === def ? propertiesOf(c.existing) : {};
+	return c.directions
+		.filter((direction) => hasProperty(def, direction) && base[direction] !== "true" && multifaceCanAttach(c.p.getBlock, c.at, direction))
+		.map((direction) => ({ def, set: { ...base, [direction]: "true" } }));
+}
+
+/** Whether a vine or glow lichen with this item in hand takes the click into its own space, to grow another face. */
+function growsAnotherFace(state: number, def: BlockDef): boolean {
+	if (blockOf(state) !== def || !MULTIFACE.has(def.type)) return false;
+	const properties = propertiesOf(state);
+	return def.properties.some((property) => (DIRECTIONS as string[]).includes(property.name) && properties[property.name] === "false");
+}
+
+/** The state of a candidate, with what every placement sets: axis, half, rotation, facing and so on. */
+function finish(candidate: Candidate, c: PlaceContext): number {
+	const { def } = candidate;
+	const { p, looking } = c;
+	const sideways = isHorizontal(p.face);
+	const upperHalf = p.face === "down" || (sideways && p.cursor.y > 0.5);
+	const set: Properties = {};
 
 	if (hasProperty(def, "axis")) set.axis = axisOf(p.face);
 	if (hasProperty(def, "rotation")) set.rotation = rotationSegment(def.type.includes("skull") || def.type.includes("head") ? p.yaw : p.yaw + 180);
 	if (hasProperty(def, "half", "top")) set.half = upperHalf ? "top" : "bottom";
 	if (hasProperty(def, "type", "double")) set.type = upperHalf ? "top" : "bottom";
-	if (hasProperty(def, "hanging")) set.hanging = String(p.face === "down");
 	if (hasProperty(def, "persistent")) set.persistent = "true"; // placed leaves never decay
 	if (hasProperty(def, "shape", "north_south")) set.shape = axisOf(looking) === "x" ? "east_west" : "north_south"; // rails
-	if (MULTIFACE.has(def.type) && hasProperty(def, OPPOSITE[p.face])) set[OPPOSITE[p.face]] = "true";
 
-	if (hasProperty(def, "face", "ceiling")) {
-		// Buttons, levers and grindstones attach to the face that was clicked.
-		set.face = p.face === "up" ? "floor" : p.face === "down" ? "ceiling" : "wall";
-		set.facing = sideways ? p.face : looking;
-	} else if (set.facing === undefined && hasProperty(def, "facing")) {
+	if (candidate.set.facing === undefined && hasProperty(def, "facing")) {
 		const sixWay = hasProperty(def, "facing", "up");
 		let facing: Direction;
 		if (def.type.includes("trap_door")) facing = sideways ? p.face : OPPOSITE[looking];
@@ -213,33 +396,62 @@ export function place(p: Placement): BlockChange[] | undefined {
 		// A block that only turns sideways cannot face up or down.
 		set.facing = hasProperty(def, "facing", facing) ? facing : OPPOSITE[looking];
 	}
+	Object.assign(set, candidate.set);
 
-	if (hasProperty(def, "hinge")) set.hinge = doorHinge(p, at, set.facing as Direction);
-	if (hasProperty(def, "waterlogged")) set.waterlogged = String(existing === WATER_SOURCE);
-
-	const changes: BlockChange[] = [{ ...at, state: stateOf(def, set) }];
-	let second: BlockChange | undefined;
-	if (hasProperty(def, "half", "upper")) {
-		changes[0]!.state = stateOf(def, { ...set, half: "lower" });
-		second = { ...offset(at, "up"), state: stateOf(def, { ...set, half: "upper" }) };
-	} else if (hasProperty(def, "part", "head")) {
-		changes[0]!.state = stateOf(def, { ...set, part: "foot" });
-		second = { ...offset(at, looking), state: stateOf(def, { ...set, part: "head" }) };
-	}
-	if (second) {
-		if (second.y > p.maxY || !isReplaceable(get(second))) return undefined;
-		changes.push(second);
-	}
-	return changes;
+	if (hasProperty(def, "hinge")) set.hinge = doorHinge(p, c.at, set.facing as Direction);
+	if (hasProperty(def, "waterlogged") && candidate.set.waterlogged === undefined) set.waterlogged = String(hasWaterSource(c.existing));
+	return stateOf(def, set);
 }
 
-/** A wall hanging sign faces along the wall, to whichever side the player is on. */
-function hangingSignFacing(wallFace: Direction, yaw: number): Direction {
-	const radians = (yaw * Math.PI) / 180;
-	const [lookX, lookZ] = [-Math.sin(radians), Math.cos(radians)];
-	const along = (direction: Direction) => lookX * OFFSET[direction][0] + lookZ * OFFSET[direction][2];
-	const [a, b] = [clockwise(wallFace), counterClockwise(wallFace)];
-	return along(a) < along(b) ? a : b;
+/**
+ * Every block change that placing this item causes, or nothing when it cannot
+ * be placed there. Doors, beds and tall plants are two blocks.
+ */
+export function place(p: Placement): BlockChange[] | undefined {
+	const def = blockForItem(p.item);
+	if (!def) return undefined;
+	const get = (at: Position) => p.getBlock(at.x, at.y, at.z);
+
+	const clickedState = get(p.clicked);
+	if (blockOf(clickedState) === def) {
+		const stacked = stackOnto(clickedState, def, p);
+		if (stacked !== undefined) return [{ ...p.clicked, state: stacked }];
+	}
+
+	const replacingClicked = isReplaceable(clickedState) || growsAnotherFace(clickedState, def);
+	const at = replacingClicked ? p.clicked : offset(p.clicked, p.face);
+	if (at.y < p.minY || at.y > p.maxY) return undefined;
+	const existing = get(at);
+	if (!replacingClicked && blockOf(existing) === def) {
+		const stacked = stackOnto(existing, def);
+		if (stacked !== undefined) return [{ ...at, state: stacked }];
+	}
+	if (!isReplaceable(existing) && !growsAnotherFace(existing, def)) return undefined;
+	if (needsWaterToPlace(def, existing)) return undefined;
+
+	const c: PlaceContext = { p, at, existing, replacingClicked, directions: nearestLookingDirections(p.yaw, p.pitch, p.face, replacingClicked), looking: horizontalFacing(p.yaw) };
+	for (const candidate of candidates(def, c)) {
+		const state = finish(candidate, c);
+		// BlockItem.canPlace: the block has to be able to stay there.
+		if (!canSurvive(p.getBlock, at, state) || (candidate.check && !candidate.check(state))) continue;
+		const placed = blockOf(state);
+		const changes: BlockChange[] = [{ ...at, state }];
+		let second: BlockChange | undefined;
+		const properties = propertiesOf(state);
+		if (hasProperty(placed, "half", "upper")) {
+			changes[0]!.state = withProperties(state, { half: "lower" });
+			second = { ...offset(at, "up"), state: withProperties(state, { half: "upper" }) };
+		} else if (hasProperty(placed, "part", "head")) {
+			changes[0]!.state = withProperties(state, { part: "foot" });
+			second = { ...offset(at, properties.facing as Direction), state: withProperties(state, { part: "head" }) };
+		}
+		if (second) {
+			if (second.y > p.maxY || !isReplaceable(get(second))) return undefined;
+			changes.push(second);
+		}
+		return changes;
+	}
+	return undefined;
 }
 
 /**
@@ -319,7 +531,8 @@ function stairShape(get: (at: Position) => number, at: Position, properties: Pro
 
 /**
  * The state a block should have given what is around it now: fences, panes and
- * walls connect, stairs form corners, fence gates sink into walls. Returns the
+ * walls connect, stairs form corners, fence gates sink into walls, vines keep
+ * only the faces that still hold. Returns the
  * same state when nothing changes.
  */
 export function reshape(getBlock: GetBlock, at: Position): number {
@@ -350,44 +563,12 @@ export function reshape(getBlock: GetBlock, at: Position): number {
 		const inWall = [clockwise(facing), counterClockwise(facing)].some((side) => blockOf(get(offset(at, side))).type === "wall");
 		return withProperties(state, { in_wall: String(inWall) });
 	}
-	return state;
+	// Vines and glow lichen let go of the faces that lost their hold; with none
+	// left they fall off (survival.ts).
+	return updatedMultiface(getBlock, at, updatedVine(getBlock, at, state));
 }
 
 // ---- support -------------------------------------------------------------------
-
-/** Block classes mounted on the side of the block behind them. */
-const WALL_MOUNTED = new Set([
-	"wall_torch",
-	"redstone_wall_torch",
-	"wall_sign",
-	"wall_banner",
-	"ladder",
-	"trip_wire_hook",
-	"coral_wall_fan",
-	"base_coral_wall_fan",
-]);
-/** Solid block classes that still need a block under them. */
-const NEEDS_FLOOR = new Set(["carpet", "wool_carpet", "repeater", "comparator", "candle", "cake", "snow_layer", "door", "weathering_copper_door", "lantern", "weathering_lantern", "bed", "straw_bed"]);
-const FLOATS = new Set([
-	"liquid", "air", "fire", "soul_fire", "nether_portal", "end_portal", "end_gateway", "structure_void", "light", "bubble_column", "trip_wire", "web",
-	"moving_piston", "powder_snow",
-]);
-/** Block classes that hang from the block above them. */
-const HANGS = new Set(["hanging_roots", "hanging_moss", "spore_blossom", "weeping_vines", "weeping_vines_plant", "cave_vines", "cave_vines_plant"]);
-
-/** Which neighbour a block is attached to, if it needs one to stay in place. */
-function supportDirection(state: number): Direction | undefined {
-	const def = blockOf(state);
-	const properties = propertiesOf(state);
-	if (properties.face === "wall" || WALL_MOUNTED.has(def.type)) return OPPOSITE[properties.facing as Direction];
-	if (properties.face === "ceiling" || properties.hanging === "true" || def.type === "ceiling_hanging_sign" || HANGS.has(def.type)) return "up";
-	if (properties.face === "floor") return "down";
-	if (properties.half === "upper" || properties.part === "head") return undefined; // held by its other half
-	if (def.type === "bed" || def.type === "straw_bed") return undefined;
-	if (MULTIFACE.has(def.type) || FLOATS.has(def.type) || def.type === "wall_hanging_sign" || def.type.includes("wall_skull")) return undefined;
-	if (def.passable || NEEDS_FLOOR.has(def.type)) return "down";
-	return undefined;
-}
 
 /** The other block of a door, bed or tall plant, if this is one. */
 export function otherHalf(state: number, at: Position): Position | undefined {
@@ -400,19 +581,19 @@ export function otherHalf(state: number, at: Position): Position | undefined {
 }
 
 /**
- * Blocks around `at` that were attached to it and are now attached to nothing:
- * the torch on its side, the flower on top, the lantern hanging below.
+ * Blocks around `at` that can no longer stay where they are now that `at`
+ * changed: the torch on its side, the flower on top, the lantern hanging
+ * below, a cactus that something was put next to. The same rule decides
+ * whether a block may be placed (survival.ts), so a block that could not have
+ * been put somewhere does not stay there either. A block saved somewhere it
+ * could not be placed stays until something next to it changes.
  */
 export function unsupportedAround(getBlock: GetBlock, at: Position): Position[] {
-	// Only a block that is gone lets go of things. Which shapes hold a torch or
-	// a lantern is not modelled, so any block that is still there keeps them.
-	const state = getBlock(at.x, at.y, at.z);
-	if (state !== AIR && !blockOf(state).passable) return [];
 	const out: Position[] = [];
 	for (const direction of ["up", "down", ...HORIZONTAL] as Direction[]) {
 		const neighbour = offset(at, direction);
-		const attached = getBlock(neighbour.x, neighbour.y, neighbour.z);
-		if (attached !== AIR && supportDirection(attached) === OPPOSITE[direction]) out.push(neighbour);
+		const state = getBlock(neighbour.x, neighbour.y, neighbour.z);
+		if (state !== AIR && !canSurvive(getBlock, neighbour, state)) out.push(neighbour);
 	}
 	return out;
 }

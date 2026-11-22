@@ -19,6 +19,16 @@ interface VersionData {
 	blockEntities: Record<string, number>;
 	passable: string[];
 	fullCubes: string[];
+	/** What block states offer to blocks resting on them, packed. See scripts/gen-data.mjs and world/survival.ts. */
+	faceMasks: number[];
+	faceTables: [properties: number[], masks: number[], runs: string][];
+	blockFaces: number[];
+	/** Blocks whose fluid is always water, without a waterlogged property. */
+	alwaysWater: string[];
+	/** Which game classes decide whether a block can stay where it is. */
+	survival: [survive: string, mayPlaceOn: string | null, tags: Record<string, string>, growth: string | null, blocks: string[]][];
+	/** Fluid registry ids. */
+	fluids: { water: number; flowing_water: number; lava: number };
 	/** [place sound, break sound, volume, pitch], indexed by a block's sound group. */
 	soundGroups: [place: number, breaking: number, volume: number, pitch: number][];
 	/** The numbers the protocol uses for the entity data this server sends. */
