@@ -61,9 +61,14 @@ Works, and covered by the tests:
 - Dropping items, seeing them on the ground, picking them up
 - Middle-click pick block
 - Plugins as separate Workers, including cancelling events
+- Transfers to another server and cookies, in every phase that has them,
+  and plugins deciding who may come in before they appear in the world:
+  the [queue example](#a-queue) runs end to end on two servers
 
 Written but not covered by a test: sprinting shown to other players and
-`/spawn`. Skins are checked by hand only.
+`/spawn`. Skins are checked by hand only. The test client asks for cookies
+during login only; a plugin asking for one from a command or another play
+hook goes through the same code but no test does it.
 
 Not there:
 
@@ -83,6 +88,10 @@ deployed 26.3 server at once, joining, chatting and building with a plugin
 command. Placing blocks, signs and doors were tried by hand on the 26.1 build;
 on 26.3 they are covered by the conformance test, which proves the game can
 read what the server sends, not that it then does the right thing with it.
+Transfers, cookies and the queue's line above the hotbar have not been tried
+with the real game at all: whether it follows the transfer, takes the cookie
+along and shows the line is up to the game, and only the conformance test's
+client has done so.
 
 ## Run it
 
@@ -145,7 +154,49 @@ and add its config to `CONFIGS` in `scripts/dev.mjs` and to the `deploy`
 script. Hooks and the server handle are documented in `src/plugins/api.ts`.
 
 Included: `guard` (spawn protection), `welcome` (greeting, `/hello`) and
-`builder` (`/sphere <block> [radius]`).
+`builder` (`/sphere <block> [radius]`). Two more, `limbo` and `gate`, make up
+the queue below and are not loaded unless asked for.
+
+Besides the event hooks, a plugin can decide whether a player may come in at
+all (`onLogin`, before anything of the world is sent to them), act once a
+second on its own (`onTimer`), show a line above the hotbar
+(`server.actionBar`), send a player to another server (`server.transfer`)
+and store and ask for cookies (`server.storeCookie`, `server.requestCookie`).
+`onLogin` fails closed: a plugin that implements it and throws, takes longer
+than 5 seconds or cannot be reached turns the player away.
+
+### A queue
+
+`plugins/limbo` is a waiting room: everyone on it stands in line in the order
+they joined and sees their place above the hotbar. Every few seconds the
+first in line is given a signed ticket as a cookie and transferred to the
+destination. `plugins/gate`, on the destination, turns away anyone who does
+not arrive by transfer with a valid ticket, before they appear in its world.
+The ticket's layout is documented in `plugins/gate/ticket.ts`, plainly
+enough to check it in a plugin for a vanilla or Paper server
+(`accepts-transfers=true`), which is the realistic destination in production:
+a Cloudflare zone gets one TCP Worker application.
+
+What a ticket proves is limited. The servers do not verify accounts, so a
+name is whatever the client says; a valid ticket proves that this name went
+through the queue in the last minute, nothing more. It is not single-use.
+
+Locally it runs as two servers. Both need the same secret, which stays out of
+git: copy `plugins/limbo/.dev.vars.example` to `plugins/limbo/.dev.vars`, set
+`QUEUE_SECRET` to a long random value (`openssl rand -hex 32`), and put the
+same line in `plugins/gate/.dev.vars`. Then, in two terminals:
+
+```sh
+INSTANCE=1 PLUGINS=limbo npm run dev           # the limbo, on localhost:25571
+INSTANCE=2 PLUGINS=gate,welcome npm run dev    # the destination, on localhost:25572
+```
+
+and join `localhost:25571`. `PLUGINS` picks which plugins an instance loads
+instead of the usual ones; the default server and `npm run deploy` never load
+these two. The limbo's settings (`DESTINATION`, `ADMIT_EVERY_SECONDS`,
+`TICKET_TTL_SECONDS`) are in `plugins/limbo/wrangler.jsonc`; a line in its
+`.dev.vars` overrides one, such as `DESTINATION=localhost:25574` for a
+destination on another instance.
 
 ## Deploy
 
@@ -218,6 +269,16 @@ the way the game does, and reads chunks with the game's chunk reader. It uses
 the jar that `npm run gen` downloaded. `JOIN_ONLY=1 npm test` only joins and
 looks, without building.
 
+`INSTANCE=1 npm run test:queue` runs the queue example instead, against its
+limbo, with the destination running too ([A queue](#a-queue)). It waits in
+line, is transferred, follows the transfer to the destination with its
+ticket and gets in, and checks that a player who did not come by transfer,
+one without a ticket, one with a tampered, expired or somebody else's ticket,
+and one whose game never answers are all turned away before they appear in
+the world. It reads the secret from `plugins/gate/.dev.vars` (or
+`QUEUE_SECRET`) and makes tickets of its own from the documented layout.
+Plain `npm test` says it skipped this.
+
 `npm run test:bots` is the older, larger suite: mineflayer bots that play
 through most features. Their library stops at Minecraft 26.1, so the server
 has to be built for that version first: `npm run gen -- 26.1.2`, then
@@ -261,7 +322,7 @@ shows as air and is kept in storage.
 | `src/protocol/` | Packet builders and the version data |
 | `src/net/` | Varints, framing, NBT |
 | `src/plugins/`, `sdk/` | Plugin API, host and SDK |
-| `plugins/` | Example plugin Workers |
+| `plugins/` | Example plugin Workers; `limbo` and `gate` are the queue |
 | `scripts/gen-data.mjs`, `scripts/Probe.java` | Generate version data from the server jar |
 | `scripts/dev.mjs` | `npm run dev`: the world and its plugins in one `wrangler dev` |
 | `test/conformance/` | The conformance test, judged by Mojang's packet code |
