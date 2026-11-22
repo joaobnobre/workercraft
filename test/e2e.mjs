@@ -158,10 +158,12 @@ async function main() {
 	let aliceGotItBack = false;
 	alice.inventory.on("updateSlot", (slot, _old, item) => (aliceGotItBack ||= item?.name === "stone"));
 	alice._client.write("block_dig", { status: 4, location: new Vec3(0, 0, 0), face: 0, sequence: 4 });
-	const seenByBob = await until(() => Object.values(bob.entities).find(isDroppedItem));
+	// Items dropped earlier lie around too (they are saved), so look for the one at her feet.
+	const atAlicesFeet = (entity) => isDroppedItem(entity) && entity.position.distanceTo(alice.entity.position) < 3;
+	const seenByBob = await until(() => Object.values(bob.entities).find(atAlicesFeet));
 	check("a dropped item appears for other players", Boolean(seenByBob), seenByBob && `${seenByBob.position}`);
 	check("the item can be picked up again", Boolean(await until(() => aliceGotItBack, 6000)));
-	check("a picked-up item disappears for other players", Boolean(await until(() => !Object.values(bob.entities).some(isDroppedItem))));
+	check("a picked-up item disappears for other players", Boolean(seenByBob && (await until(() => !bob.entities[seenByBob.id]))));
 
 	// ---- building like vanilla ----
 	// Alice stands at (baseX, baseZ) and looks north. Everything is built on the

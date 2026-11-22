@@ -47,7 +47,9 @@ const classes = join(cache, "conformance");
 
 const sources = ["Conformance.java", "ItemTests.java"].map((file) => join(root, "test/conformance", file));
 execFileSync("javac", ["-nowarn", "-proc:none", "-Xlint:-deprecation", "-cp", classpath, "-d", classes, ...sources], { stdio: "inherit" });
-const run = spawnSync("java", ["-cp", [classes, classpath].join(delimiter), "Conformance", process.env.HOST ?? "127.0.0.1", process.env.PORT ?? String(devInstance().gamePort)], {
+// RESTART_PHASE runs one step of test/restart.mjs instead (see ItemTests.main).
+const main = process.env.RESTART_PHASE ? "ItemTests" : "Conformance";
+const run = spawnSync("java", ["-cp", [classes, classpath].join(delimiter), main, process.env.HOST ?? "127.0.0.1", process.env.PORT ?? String(devInstance().gamePort)], {
 	cwd: cache,
 	env,
 	stdio: ["ignore", "inherit", process.env.CONFORMANCE_TRACE ? "inherit" : "ignore"],

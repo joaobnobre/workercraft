@@ -69,6 +69,7 @@ Works, and covered by the tests:
 - Items keeping their enchantments, names, potions, colours, patterns, the
   contents of a shulker box and other data components, checked before anyone
   else sees them ([Items](#items) says which, and where)
+- Items on the ground surviving the world going idle and the server restarting
 - Middle-click pick block
 - Plugins as separate Workers, including cancelling events
 - Transfers to another server and cookies, in every phase that has them,
@@ -96,7 +97,6 @@ Not there:
   stay with the player who has the item and are lost when it is dropped or
   the player leaves; see [Items](#items). Middle-click with Ctrl does not
   copy a block's data.
-  Items on the ground are not saved.
 
 How far it has been tried with the real game: two people have been on the
 deployed 26.3 server at once, joining, chatting and building with a plugin
@@ -176,7 +176,7 @@ contents not understood. Lists have limits (64 enchantments or lines of lore,
 | The player's own inventory, while they are online | kept | kept, but never sent to anyone |
 | Shown to others in a hand, as armour or on the ground | shown, except a container's contents and lore, which nobody sees there | not shown |
 | Dropped and picked up, by anyone | kept | lost |
-| Saved inventories | kept, for the same game version | lost |
+| Saved: inventories and items on the ground | kept, for the same game version | lost |
 
 Unchecked components are not even saved for the player who sent them: names
 are not verified, so whoever joins under a name next is not necessarily the
@@ -191,6 +191,14 @@ are the same, and middle-click only picks a hotbar slot whose item has none,
 as in the game. Others are told about a change in a player's hands or armour,
 components included, at most once a tick, and drops from the creative
 inventory are limited the way a vanilla server limits them.
+
+Items on the ground are saved with their position, stack, age and the rest of
+their state, in one transaction: every 30 seconds while someone is online,
+the ones that changed, and when the last player leaves, those too and the
+ones that aged 30 seconds or more since they were last written. A crash
+loses at most those 30 seconds, and an item may then live up to 30 seconds
+longer than it should have. The limit of 256 items and their five minutes
+of life (counted only while someone is online) are as before.
 
 Items are stored by name, so they survive a change of game version.
 Components hold ids that belong to one version (of enchantments, potions, the
@@ -424,6 +432,12 @@ Both read `INSTANCE`, or `HOST` and `PORT`, to find the server
 needs a server started with low limits, so it can reach them; the command is
 at the top of `test/limits.mjs`. It takes about a minute.
 
+`INSTANCE=<n> npm run test:restart` checks that items on the ground survive
+the server stopping: it starts its own server on an instance that is not
+running, drops items, lets the world go idle, drops more while a player stays
+online past a save, kills the server, starts it again and looks for all of
+them with the conformance test's client (26.3). It takes about a minute.
+
 ## Other game versions
 
 ```sh
@@ -443,7 +457,8 @@ A world does not depend on the version: blocks are stored by name, so one
 saved under 26.1 opens under 26.3. A block the running version does not have
 shows as air and is kept in storage. Items are stored by name too; their
 components only come back under the version they were saved with
-([Items](#items)).
+([Items](#items)), and an item on the ground that the version does not have
+is kept in storage.
 
 ## Layout
 
@@ -467,6 +482,7 @@ components only come back under the version they were saved with
 | `scripts/gen-data.mjs`, `scripts/Probe.java` | Generate version data from the server jar |
 | `scripts/dev.mjs` | `npm run dev`: the world and its plugins in one `wrangler dev` |
 | `test/conformance/` | The conformance test, judged by Mojang's packet code; `ItemTests.java` for items |
+| `test/restart.mjs` | Items on the ground across a restart |
 | `test/e2e.mjs` | The bot suite (26.1 build only) |
 | `test/limits.mjs` | The test of the limits per address |
 

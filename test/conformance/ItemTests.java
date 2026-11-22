@@ -331,6 +331,94 @@ class ItemTests {
 		back.quit();
 	}
 
+	// ---- dropped items across a restart (test/restart.mjs) ----
+
+	/** What test/restart.mjs drops: before the world goes idle, and before it is killed with a player online. */
+	static Map<String, ItemStack> restartStacks(RegistryAccess registries, boolean idle) {
+		Map<String, ItemStack> stacks = new LinkedHashMap<>();
+		if (idle) {
+			ItemEnchantments.Mutable sharp = new ItemEnchantments.Mutable(ItemEnchantments.EMPTY);
+			sharp.set(registries.lookupOrThrow(Registries.ENCHANTMENT).getOrThrow(Enchantments.SHARPNESS), 4);
+			ItemStack sword = with(Items.DIAMOND_SWORD, s -> {
+				s.set(DataComponents.CUSTOM_NAME, Component.literal("Left behind").withStyle(ChatFormatting.AQUA));
+				s.set(DataComponents.ENCHANTMENTS, sharp.toImmutable());
+			});
+			stacks.put("a named, enchanted sword", sword);
+			stacks.put("a filled shulker box", shulkerOf(sword.copy(), new ItemStack(Items.STONE, 64)));
+		} else {
+			stacks.put("a potion", with(Items.POTION, s -> s.set(DataComponents.POTION_CONTENTS, new PotionContents(Potions.SWIFTNESS))));
+			stacks.put("sixteen firework rockets", with(Items.FIREWORK_ROCKET, s -> {
+				s.set(DataComponents.FIREWORKS, new Fireworks(3, List.of()));
+				s.setCount(16);
+			}));
+		}
+		return stacks;
+	}
+
+	/**
+	 * One step of test/restart.mjs, from RESTART_PHASE: "idle" drops items and
+	 * leaves, so that the world goes idle; "crash" drops items and stays
+	 * online past the periodic save, then waits to be cut off; "after" joins
+	 * the restarted server and looks for both.
+	 */
+	public static void main(String[] args) throws Exception {
+		net.minecraft.SharedConstants.tryDetectVersion();
+		net.minecraft.server.Bootstrap.bootStrap();
+		String host = args[0];
+		int port = Integer.parseInt(args[1]);
+		String phase = System.getenv("RESTART_PHASE");
+		String tag = System.getenv("RESTART_TAG");
+		String[] at = System.getenv("RESTART_AT").split(",");
+		int x = Integer.parseInt(at[0]);
+		int z = Integer.parseInt(at[1]);
+		try {
+			if (phase.equals("after")) checkAfterRestart(host, port, tag, x, z);
+			else dropBeforeRestart(host, port, tag, x, z, phase.equals("idle"));
+		} catch (Throwable problem) {
+			check("the " + phase + " step finishes", false, problem);
+		}
+		Conformance.say(Conformance.failures == 0 ? "All checks passed." : Conformance.failures + " check(s) failed.");
+		System.exit(Conformance.failures == 0 ? 0 : 1);
+	}
+
+	static void dropBeforeRestart(String host, int port, String tag, int x, int z, boolean idle) throws Exception {
+		Conformance.Client client = join(host, port, (idle ? "leaver_" : "stayer_") + tag);
+		if (client.error != null) return;
+		double spotX = x + (idle ? 0.5 : 10.5);
+		check("the dropper gets to the spot", goTo(client, spotX, z + 0.5, 90), client.position);
+		for (ItemStack stack : restartStacks(client.registries, idle).values()) client.send(new ServerboundSetCreativeModeSlotPacket(DROP, stack));
+		Thread.sleep(500);
+		goTo(client, spotX + 30, z + 0.5, 0); // out of reach, so nobody picks them up
+		if (idle) {
+			client.quit();
+			Thread.sleep(1000);
+			Conformance.say("dropped, and the world is empty");
+			return;
+		}
+		Thread.sleep(32_000); // past one periodic save
+		check("nothing the dropper received was unreadable", client.error == null, client.error);
+		Conformance.say("READY: kill the server now");
+		Thread.sleep(120_000);
+	}
+
+	static void checkAfterRestart(String host, int port, String tag, int x, int z) throws Exception {
+		Conformance.Client client = join(host, port, "looker_" + tag);
+		if (client.error != null) return;
+		for (boolean idle : List.of(true, false)) {
+			double spotX = x + (idle ? 0.5 : 10.5);
+			// Every dropped item is sent to whoever joins.
+			for (Map.Entry<String, ItemStack> expected : restartStacks(client.registries, idle).entrySet()) {
+				boolean found = Conformance.until(() -> client.received(net.minecraft.network.protocol.game.ClientboundAddEntityPacket.class).stream()
+					.filter(p -> p.getType() == net.minecraft.world.entity.EntityTypes.ITEM && Math.abs(p.getX() - spotX) < 1.5 && Math.abs(p.getZ() - (z + 0.5)) < 1.5)
+					.anyMatch(p -> client.received(ClientboundSetEntityDataPacket.class).stream().anyMatch(data -> data.id() == p.getId() && data.packedItems().stream()
+						.anyMatch(v -> v.serializer() == EntityDataSerializers.ITEM_STACK && same(client, (ItemStack) v.value(), client.registries, shown(expected.getValue()))))));
+				check(expected.getKey() + (idle ? " dropped before the world went idle" : " dropped before the server was killed") + " is still there", found);
+			}
+		}
+		check("nothing the looker received was unreadable", client.error == null, client.error);
+		client.quit();
+	}
+
 	static void hostile(String host, int port, String suffix, int x, int z, Conformance.Client erin) throws Exception {
 		Conformance.Client mallory = join(host, port, "mallory_" + suffix);
 		if (mallory.error != null) return;

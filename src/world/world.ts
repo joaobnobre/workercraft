@@ -4,7 +4,7 @@
 
 import { DurableObject, RpcTarget } from "cloudflare:workers";
 import { keyFromTarget } from "../net/address";
-import { bytesToUuid, concat } from "../net/bytes";
+import { bytesToUuid, concat, uuidToBytes } from "../net/bytes";
 import type { Text } from "../net/nbt";
 import type { PlayerInfo, Server } from "../plugins/api";
 import { SPAWN, builtin } from "../plugins/builtin";
@@ -119,6 +119,12 @@ const MAX_DROPPED_ITEMS = 256;
 /** Vanilla's limit on drops from the creative inventory: each costs 20, one is forgiven per tick, past 1480 none. */
 const CREATIVE_DROP_COST = 20;
 const CREATIVE_DROP_LIMIT = 1480;
+/**
+ * Changes to dropped items are written to storage at most this often while
+ * players are online, and all of them when the last one leaves. A crash loses
+ * at most this much of their movement and ageing.
+ */
+const ITEM_SAVE_TICKS = 30 * 20;
 const EYE_HEIGHT = 1.62;
 const NOON = 6000;
 const CHAT_BURST = 5;
@@ -132,6 +138,10 @@ export class World extends DurableObject<Env> {
 	private logins = new Map<string, Session>();
 	private timerCount = 0;
 	private items = new Map<number, DroppedItem>();
+	/** Dropped items changed since they were last saved, by UUID; undefined for one that is gone. */
+	private unsavedItems = new Map<string, DroppedItem | undefined>();
+	/** How old each dropped item was when it was last written to storage. */
+	private savedAges = new WeakMap<DroppedItem, number>();
 	private blocks: BlockStore;
 	private skins: SkinCache;
 	private plugins: PluginHost;
@@ -154,6 +164,8 @@ export class World extends DurableObject<Env> {
 		this.skins = new SkinCache(sql);
 		sql.exec("CREATE TABLE IF NOT EXISTS players (name TEXT PRIMARY KEY, x REAL, y REAL, z REAL, yaw REAL, pitch REAL)");
 		sql.exec("CREATE TABLE IF NOT EXISTS inventories (name TEXT PRIMARY KEY, held INTEGER NOT NULL, slots TEXT NOT NULL)");
+		sql.exec("CREATE TABLE IF NOT EXISTS dropped_items (uuid TEXT PRIMARY KEY, data TEXT NOT NULL)");
+		this.loadItems();
 		this.maxPlayers = Number(env.MAX_PLAYERS) || 100;
 		this.maxViewDistance = Math.min(Math.max(Number(env.VIEW_DISTANCE) || 8, 2), 32);
 		this.limits = new AddressLimits(env);
@@ -321,6 +333,7 @@ export class World extends DurableObject<Env> {
 			// Nothing ticks from here on, so whatever was waiting happens now.
 			for (const { run } of this.scheduled.splice(0)) run();
 			this.blocks.flush();
+			this.saveItems(true);
 		}
 		void this.plugins.notify("onQuit", { player: info(player) });
 	}
@@ -334,6 +347,7 @@ export class World extends DurableObject<Env> {
 			for (const { run } of due) run();
 		}
 		this.tickItems();
+		if (this.tickCount % ITEM_SAVE_TICKS === 0) this.saveItems(false);
 		for (const player of this.players.values()) {
 			if (player.equipmentChanged) this.sendEquipment(player);
 			if (player.creativeDrops > 0) player.creativeDrops--;
@@ -354,7 +368,10 @@ export class World extends DurableObject<Env> {
 	private tickItems(): void {
 		const solid = (x: number, y: number, z: number) => this.blocks.getBlock(x, y, z) !== AIR;
 		for (const item of this.items.values()) {
-			if (stepItem(item, solid)) this.broadcastSoon(out.itemPosition(item, true));
+			if (stepItem(item, solid)) {
+				this.broadcastSoon(out.itemPosition(item, true));
+				this.itemChanged(item);
+			}
 			if (item.age > ITEM_LIFETIME_TICKS || item.y < MIN_Y - 64) this.removeItem(item);
 			else if (item.pickupDelay === 0) this.pickUp(item);
 		}
@@ -362,6 +379,7 @@ export class World extends DurableObject<Env> {
 
 	private removeItem(item: DroppedItem): void {
 		this.items.delete(item.entityId);
+		this.itemChanged(item, true);
 		this.broadcast(out.removeEntities([item.entityId]));
 	}
 
@@ -386,8 +404,93 @@ export class World extends DurableObject<Env> {
 			resting: false,
 		};
 		this.items.set(dropped.entityId, dropped);
+		this.itemChanged(dropped);
 		if (this.items.size > MAX_DROPPED_ITEMS) this.removeItem(this.items.values().next().value!);
 		this.broadcast(out.addItemEntity(dropped));
+	}
+
+	private itemChanged(item: DroppedItem, gone = false): void {
+		this.unsavedItems.set(bytesToUuid(item.uuid), gone ? undefined : item);
+	}
+
+	/**
+	 * Writes the dropped items that changed to storage, in one transaction,
+	 * each as it is at that moment. With `all`, also those that aged
+	 * noticeably since they were last written.
+	 */
+	private saveItems(all: boolean): void {
+		if (all) {
+			for (const item of this.items.values()) {
+				if (item.age - (this.savedAges.get(item) ?? -Infinity) >= ITEM_SAVE_TICKS) this.itemChanged(item);
+			}
+		}
+		if (this.unsavedItems.size === 0) return;
+		const pending = [...this.unsavedItems];
+		this.unsavedItems.clear();
+		const sql = this.ctx.storage.sql;
+		this.ctx.storage.transactionSync(() => {
+			for (const [uuid, item] of pending) {
+				const name = item && itemName(item.item);
+				if (!item || name === undefined) {
+					sql.exec("DELETE FROM dropped_items WHERE uuid = ?", uuid);
+					continue;
+				}
+				const { count, x, y, z, vx, vy, vz, age, pickupDelay, resting } = item;
+				const saved = { item: name, count, components: saveComponents(item.components), x, y, z, vx, vy, vz, age, pickupDelay, resting };
+				sql.exec("INSERT OR REPLACE INTO dropped_items (uuid, data) VALUES (?, ?)", uuid, JSON.stringify(saved));
+				this.savedAges.set(item, age);
+			}
+		});
+	}
+
+	/**
+	 * Puts back the dropped items the world had when it last went idle. A row
+	 * that does not make an item in this game version stays in storage, like a
+	 * block the version does not have.
+	 */
+	private loadItems(): void {
+		const loaded: DroppedItem[] = [];
+		const stale: string[] = [];
+		for (const row of this.ctx.storage.sql.exec<{ uuid: string; data: string }>("SELECT uuid, data FROM dropped_items")) {
+			try {
+				const saved = JSON.parse(row.data);
+				const item = itemId(String(saved.item));
+				if (item === undefined) continue; // another version's item: kept
+				const numbers = [saved.count, saved.x, saved.y, saved.z, saved.vx, saved.vy, saved.vz, saved.age, saved.pickupDelay];
+				const count = Math.min(Math.floor(saved.count), stackSize(item));
+				if (!numbers.every(Number.isFinite) || !/^[0-9a-f]{32}$/.test(row.uuid) || count <= 0 || saved.age > ITEM_LIFETIME_TICKS) {
+					stale.push(row.uuid);
+					continue;
+				}
+				loaded.push({
+					entityId: 0,
+					uuid: uuidToBytes(row.uuid),
+					item,
+					count,
+					components: loadComponents(saved.components),
+					x: saved.x,
+					y: saved.y,
+					z: saved.z,
+					vx: saved.vx,
+					vy: saved.vy,
+					vz: saved.vz,
+					age: Math.max(0, Math.floor(saved.age)),
+					pickupDelay: Math.max(0, Math.floor(saved.pickupDelay)),
+					resting: saved.resting === true,
+				});
+			} catch {
+				stale.push(row.uuid); // does not parse
+			}
+		}
+		// Oldest first, which is the order in which the item limit removes them.
+		loaded.sort((a, b) => b.age - a.age);
+		for (const item of loaded.slice(0, -MAX_DROPPED_ITEMS)) stale.push(bytesToUuid(item.uuid));
+		for (const uuid of stale) this.unsavedItems.set(uuid, undefined); // deleted with the next save
+		for (const item of loaded.slice(-MAX_DROPPED_ITEMS)) {
+			item.entityId = this.nextEntityId++;
+			this.items.set(item.entityId, item);
+			this.savedAges.set(item, item.age);
+		}
 	}
 
 	private pickUp(item: DroppedItem): void {
@@ -398,7 +501,10 @@ export class World extends DurableObject<Env> {
 			this.broadcast(out.takeItem(item.entityId, player.entityId, taken));
 			item.count -= taken;
 			if (item.count <= 0) this.removeItem(item);
-			else this.broadcast(out.itemEntityStack(item.entityId, item));
+			else {
+				this.itemChanged(item);
+				this.broadcast(out.itemEntityStack(item.entityId, item));
+			}
 			return;
 		}
 	}
