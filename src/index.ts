@@ -6,10 +6,14 @@
 //
 // Both tell the world which client they are for (an address turned into a key,
 // see net/address.ts), so it can hold each address to its limits.
+//
+// With the CLOSED variable set the server is closed: pings are still answered,
+// whoever tries to join is shown that variable's text instead, and the world
+// is never woken.
 
 import { Deframer, Reader, concat } from "./net/bytes";
 import type { Text } from "./net/nbt";
-import { statusPong, statusResponse } from "./protocol/packets";
+import { loginDisconnect, statusPong, statusResponse } from "./protocol/packets";
 import { PROTOCOL, S, VERSION_NAME } from "./protocol/version";
 import { clientKey, worldTarget } from "./net/address";
 import type { Env, WorldStatus } from "./world/world";
@@ -29,6 +33,18 @@ const DEFAULT_MOTD: Text = {
 		{ text: "one Durable Object, zero JVMs", color: "dark_gray" },
 	],
 };
+
+/** A variable holding text: plain, or a JSON text component for colours and more than one style. */
+function textOf(value: string): Text {
+	if (/^\s*[{[]/.test(value)) {
+		try {
+			return JSON.parse(value) as Text;
+		} catch {
+			// Not JSON after all: shown as it is.
+		}
+	}
+	return { text: value };
+}
 
 function world(env: Env) {
 	return env.WORLD.getByName("main");
@@ -90,6 +106,15 @@ export default {
 				return;
 			}
 
+			if (env.CLOSED) {
+				// Closed: say why once the client has started its login, and hang up.
+				await nextPacket();
+				const writer = socket.writable.getWriter();
+				await writer.write(loginDisconnect(textOf(env.CLOSED)));
+				await writer.close();
+				return;
+			}
+
 			// Joining. Hand the connection to the world, replaying what was already read.
 			clearTimeout(timeout);
 			reader.releaseLock();
@@ -122,6 +147,7 @@ export default {
 
 	/** The same Worker over HTTP: who is online, as JSON. */
 	async fetch(_request: Request, env: Env): Promise<Response> {
+		if (env.CLOSED) return Response.json({ version: VERSION_NAME, protocol: PROTOCOL, closed: true, online: 0, max: 0, players: [] });
 		const status = await world(env).status();
 		return Response.json({ version: VERSION_NAME, protocol: PROTOCOL, ...status });
 	},
@@ -129,12 +155,12 @@ export default {
 
 /** The server list entry, or undefined if this client is over the ping limit. */
 async function statusJson(env: Env, client: string | undefined): Promise<unknown> {
-	const status: WorldStatus | null = await world(env).status(client);
+	const status: WorldStatus | null = env.CLOSED ? { online: 0, max: 0, players: [] } : await world(env).status(client);
 	if (!status) return undefined;
 	return {
 		version: { name: VERSION_NAME, protocol: PROTOCOL },
 		players: { max: status.max, online: status.online, sample: status.players.slice(0, 12).map(({ name, uuid }) => ({ name, id: uuid })) },
-		description: env.MOTD ? { text: env.MOTD } : DEFAULT_MOTD,
+		description: env.MOTD ? textOf(env.MOTD) : DEFAULT_MOTD,
 		enforcesSecureChat: false,
 	};
 }
