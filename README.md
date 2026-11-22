@@ -108,12 +108,12 @@ whether a refused block leaves anything behind on a real game's screen has
 not been tried. Transfers, cookies and the queue's line above the hotbar have
 not been tried with the real game at all: whether it follows the transfer,
 takes the cookie along and shows the line is up to the game, and only the
-conformance test's client has done so. Item components have not been tried with the real game
-either: the conformance test shows that the game decodes every stack the
-server sends and that it equals the one built, not that it is drawn right (a
-glint, a banner's patterns or a head's skin in someone's hand), nor how the
-real game's creative screen behaves when the server's copy of a stack lacks
-a component it did not understand.
+conformance test's client has done so. Item components have not been tried
+with the real game either: the conformance test shows that the game decodes
+every stack the server sends and that it equals the one built, not that it is
+drawn right (a glint, a banner's patterns or a head's skin in someone's
+hand), nor how the real game's creative screen behaves when the server's copy
+of a stack lacks a component it did not understand.
 
 ### What holds a block
 
