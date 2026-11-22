@@ -3,6 +3,7 @@
 // game logic needs no locks. The changed blocks live in its SQLite storage.
 
 import { DurableObject, RpcTarget } from "cloudflare:workers";
+import { keyFromTarget } from "../net/address";
 import { bytesToUuid, concat } from "../net/bytes";
 import type { Text } from "../net/nbt";
 import type { PlayerInfo, Server } from "../plugins/api";
@@ -29,10 +30,11 @@ import {
 } from "./building";
 import { BlockStore, MAX_Y, MIN_Y, chunkKey } from "./chunks";
 import { ITEM_LIFETIME_TICKS, PICKUP_DELAY_TICKS, canPickUp, stepItem, throwVelocity, type DroppedItem } from "./items";
+import { AddressLimits, refuse, type LimitSettings } from "./limits";
 import { Session, type ClientSettings, type PlayerAction } from "./session";
 import { SkinCache } from "./skins";
 
-export interface Env {
+export interface Env extends LimitSettings {
 	WORLD: DurableObjectNamespace<World>;
 	MOTD?: string;
 	MAX_PLAYERS?: string;
@@ -135,6 +137,7 @@ export class World extends DurableObject<Env> {
 	private keepAliveSentAt = 0;
 	private maxPlayers: number;
 	private maxViewDistance: number;
+	private limits: AddressLimits;
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -145,15 +148,32 @@ export class World extends DurableObject<Env> {
 		sql.exec("CREATE TABLE IF NOT EXISTS inventories (name TEXT PRIMARY KEY, held INTEGER NOT NULL, slots TEXT NOT NULL)");
 		this.maxPlayers = Number(env.MAX_PLAYERS) || 100;
 		this.maxViewDistance = Math.min(Math.max(Number(env.VIEW_DISTANCE) || 8, 2), 32);
+		this.limits = new AddressLimits(env);
 		this.plugins = new PluginHost([{ name: "builtin", hooks: builtin }], env as unknown as Record<string, unknown>, new ServerApi(this));
 	}
 
-	/** Entry point for a player's TCP connection, forwarded by the Worker. */
+	/**
+	 * Entry point for a player's TCP connection, forwarded by the Worker. The
+	 * address the Worker connected to carries the client's key (see net/address.ts).
+	 */
 	async connect(socket: Socket): Promise<void> {
-		await new Session(this, socket).run();
+		socket.closed.catch(() => {});
+		const client = keyFromTarget((await socket.opened.catch(() => undefined))?.localAddress);
+		const refusal = this.limits.join(client);
+		if (refusal) return refuse(socket, refusal);
+		try {
+			await new Session(this, socket).run();
+		} finally {
+			this.limits.closed(client);
+		}
 	}
 
-	status(): WorldStatus {
+	/**
+	 * Who is online. With a client key it is a server list ping from that
+	 * client, which gets null instead when it is over the ping limit.
+	 */
+	status(client?: string): WorldStatus | null {
+		if (client !== undefined && !this.limits.ping(client)) return null;
 		return { online: this.players.size, max: this.maxPlayers, players: this.playerInfos().map(({ name, uuid }) => ({ name, uuid })) };
 	}
 
