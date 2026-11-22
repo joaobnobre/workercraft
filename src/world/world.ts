@@ -38,6 +38,8 @@ import { SkinCache } from "./skins";
 export interface Env extends LimitSettings {
 	WORLD: DurableObjectNamespace<World>;
 	MOTD?: string;
+	/** Set to close the server: nobody can join, and this text is what they are shown. */
+	CLOSED?: string;
 	MAX_PLAYERS?: string;
 	VIEW_DISTANCE?: string;
 	/** Set to "off" to never call Mojang's profile API. */

@@ -4,9 +4,9 @@
 scratch in TypeScript, running on Cloudflare Workers. No JVM, no container, no
 VM: a Worker takes the TCP connection and a Durable Object is the world.
 
-A demo world runs at **`mc.bad.engineering`** (Java Edition 26.3). It is a
-public creative world that checks nobody's account, so expect a mess, and it
-may not stay up.
+A demo world ran at **`mc.bad.engineering`** (Java Edition 26.3): a public
+creative world that checked nobody's account. It is closed for now; the
+address still answers, with a note for whoever tries to join.
 
 ## How it works
 
@@ -341,6 +341,11 @@ Things worth knowing:
   while players are connected, then restarts and disconnects them.
 - `wrangler tail` does not show what the world logs. The Workers Observability
   query API does.
+- To close a server without taking it down, set the `CLOSED` variable to the
+  text people should read: the server list still shows it, whoever tries to
+  join is shown that text, and the world is never woken. `CLOSED` and `MOTD`
+  take plain text or a JSON text component, for example
+  `wrangler deploy --var 'CLOSED:Back soon.'`.
 - The limits per address rely on Spectrum telling the Worker the client's
   address. Cloudflare documents that it does; it has not been checked on the
   deployed server yet. Without it nothing is limited, and the world logs that

@@ -19,6 +19,9 @@
 		{ "binding": "PLUGIN_BUILDER", "service": "workercraft-plugin-builder" }
 	],
 	"vars": {
+		// Two more, unset by default, take plain text or a JSON text component:
+		// "MOTD", the server list entry, and "CLOSED", which closes the server:
+		// whoever tries to join is shown its text and the world is never woken.
 		"MAX_PLAYERS": "100",
 		// Limits per client address (an IPv4 address, or an IPv6 /64), so one
 		// machine cannot take every slot. "0" turns a limit off. Connections in
