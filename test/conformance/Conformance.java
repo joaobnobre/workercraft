@@ -826,8 +826,13 @@ public class Conformance {
 		long expiresAt = ByteBuffer.wrap(issued, 1, 8).getLong();
 		long now = System.currentTimeMillis() / 1000;
 		check("the ticket expires soon", expiresAt > now && expiresAt < now + 3600, (expiresAt - now) + " s from now");
-		check("the transferred player leaves the limbo", second.sawChat(first.name + " left")
-			&& second.awaitPacket(ClientboundRemoveEntitiesPacket.class, p -> p.entityIds().contains(first.entityId)));
+		// The turn may have come while the others were still joining. A player who
+		// joined after that was never told about the first one, which shows the
+		// same thing: the first one, who had joined, was no longer there.
+		boolean sawFirst = second.timesListed(first.name) > 0;
+		check("the transferred player leaves the limbo", !sawFirst || (second.sawChat(first.name + " left")
+			&& second.awaitPacket(ClientboundRemoveEntitiesPacket.class, p -> p.entityIds().contains(first.entityId))),
+			sawFirst ? "seen leaving" : "already gone when the last in line joined");
 		check("the others move up the line", second.sawActionBar("Place in queue: 1 of 1", 20000) && middle.transfer != null,
 			second.received(ClientboundSystemChatPacket.class).stream().filter(ClientboundSystemChatPacket::overlay).map(p -> p.content().getString()).distinct().toList());
 

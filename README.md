@@ -150,7 +150,7 @@ export default definePlugin({ onBlockBreak: guard, onBlockPlace: guard });
 
 A plugin is a Worker with its own `wrangler.jsonc`. To load it, bind it to the
 world under a name starting with `PLUGIN_` (see `services` in `wrangler.jsonc`)
-and add its config to `CONFIGS` in `scripts/dev.mjs` and to the `deploy`
+and add its config to `DEFAULT_CONFIGS` in `scripts/dev.mjs` and to the `deploy`
 script. Hooks and the server handle are documented in `src/plugins/api.ts`.
 
 Included: `guard` (spawn protection), `welcome` (greeting, `/hello`) and
