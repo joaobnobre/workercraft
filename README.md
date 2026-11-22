@@ -103,6 +103,27 @@ It downloads the official server jar into `.cache/`, runs the jar's own data
 generator, asks its classes a few questions (`scripts/Probe.java`) and writes
 `src/generated/v777.json`. The game server itself is never started.
 
+### More than one server
+
+`INSTANCE=<n>` (1 to 99) starts a separate server beside the default one, for
+example one per git worktree:
+
+```sh
+INSTANCE=2 npm run dev        # or npm run dev:26.1
+INSTANCE=2 npm test           # the tests find it too
+```
+
+Instance `n` takes the game port `25570+n` and HTTP port `8790+n`, its
+Workers' names end in `-n`, and its world is kept in `.wrangler/state-n`.
+`npm run dev -- --print` shows what would start, without starting it.
+`HOST` and `PORT` still pick any other server for the tests.
+
+A new worktree needs `npm ci` and `npm run gen` (and `npm run gen -- 26.1.2`
+for the bot suite). To skip the download, copy another checkout's
+`.cache/mc-<version>` first, such as
+`mkdir -p .cache && cp -a ../workercraft/.cache/mc-26.3 .cache/`. Copy it
+rather than link it: the conformance test compiles into it.
+
 ## Plugins
 
 ```ts
@@ -120,8 +141,8 @@ export default definePlugin({ onBlockBreak: guard, onBlockPlace: guard });
 
 A plugin is a Worker with its own `wrangler.jsonc`. To load it, bind it to the
 world under a name starting with `PLUGIN_` (see `services` in `wrangler.jsonc`)
-and add its config to the `dev` script. Hooks and the server handle are
-documented in `src/plugins/api.ts`.
+and add its config to `CONFIGS` in `scripts/dev.mjs` and to the `deploy`
+script. Hooks and the server handle are documented in `src/plugins/api.ts`.
 
 Included: `guard` (spawn protection), `welcome` (greeting, `/hello`) and
 `builder` (`/sphere <block> [radius]`).
@@ -203,6 +224,9 @@ has to be built for that version first: `npm run gen -- 26.1.2`, then
 `npm run dev:26.1`. Its checks have time limits and fail at random on a busy
 machine.
 
+Both read `INSTANCE`, or `HOST` and `PORT`, to find the server
+([More than one server](#more-than-one-server)).
+
 ## Other game versions
 
 ```sh
@@ -239,6 +263,7 @@ shows as air and is kept in storage.
 | `src/plugins/`, `sdk/` | Plugin API, host and SDK |
 | `plugins/` | Example plugin Workers |
 | `scripts/gen-data.mjs`, `scripts/Probe.java` | Generate version data from the server jar |
+| `scripts/dev.mjs` | `npm run dev`: the world and its plugins in one `wrangler dev` |
 | `test/conformance/` | The conformance test, judged by Mojang's packet code |
 | `test/e2e.mjs` | The bot suite (26.1 build only) |
 

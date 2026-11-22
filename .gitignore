@@ -1,5 +1,7 @@
 node_modules
 .wrangler
+# Per-instance copies of the configs, see scripts/dev.mjs.
+.wrangler-instance-*.jsonc
 .cache
 .dev.vars
 # Version data extracted from Mojang's server jar. Recreate it with `npm run gen`.

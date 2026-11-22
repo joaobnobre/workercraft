@@ -8,6 +8,7 @@
 
 import { once } from "node:events";
 import { createRequire } from "node:module";
+import { devInstance } from "../scripts/instance.mjs";
 
 const require = createRequire(import.meta.url);
 const mineflayer = require("mineflayer");
@@ -15,7 +16,7 @@ const mc = require("minecraft-protocol");
 const { Vec3 } = require("vec3");
 
 const host = process.env.HOST ?? "127.0.0.1";
-const port = Number(process.env.PORT ?? 25565);
+const port = Number(process.env.PORT ?? devInstance().gamePort);
 const version = process.env.MC_VERSION ?? "26.1";
 
 let failures = 0;
