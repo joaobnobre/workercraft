@@ -20,6 +20,15 @@
 	],
 	"vars": {
 		"MAX_PLAYERS": "100",
+		// Limits per client address (an IPv4 address, or an IPv6 /64), so one
+		// machine cannot take every slot. "0" turns a limit off. Connections in
+		// the world at once, counted from the handshake until they close:
+		"MAX_CONNECTIONS_PER_ADDRESS": "10",
+		// New connections, as "N/T": N at once, then N more over every T seconds
+		// (for joins here, one every 3 seconds). Joins and server list pings are
+		// counted apart.
+		"JOINS_PER_ADDRESS": "20/60",
+		"PINGS_PER_ADDRESS": "120/60",
 		// Chunks sent around each player, as a radius.
 		"VIEW_DISTANCE": "8",
 		// "off" stops the lookups of player skins on Mojang's API.

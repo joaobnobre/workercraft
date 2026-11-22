@@ -64,6 +64,8 @@ Works, and covered by the tests:
 - Transfers to another server and cookies, in every phase that has them,
   and plugins deciding who may come in before they appear in the world:
   the [queue example](#a-queue) runs end to end on two servers
+- Limits per client address on connections at once and on new connections
+  ([Limits per address](#limits-per-address))
 
 Written but not covered by a test: sprinting shown to other players and
 `/spawn`. Skins are checked by hand only. The test client asks for cookies
@@ -228,6 +230,10 @@ Things worth knowing:
   while players are connected, then restarts and disconnects them.
 - `wrangler tail` does not show what the world logs. The Workers Observability
   query API does.
+- The limits per address rely on Spectrum telling the Worker the client's
+  address. Cloudflare documents that it does; it has not been checked on the
+  deployed server yet. Without it nothing is limited, and the world logs that
+  once.
 
 Open questions for production, none of them answered by the beta docs yet:
 
@@ -235,6 +241,29 @@ Open questions for production, none of them answered by the beta docs yet:
   hours. Locally, 100 players all moving cost a few CPU-seconds per 10 seconds.
 - How long such a connection may stay open.
 - What Spectrum charges for traffic on Pro and Business.
+
+### Limits per address
+
+One address may not fill the server or flood it with connections. The
+variables are in `wrangler.jsonc`, next to `MAX_PLAYERS`:
+
+| Variable | Default | What |
+|---|---|---|
+| `MAX_CONNECTIONS_PER_ADDRESS` | `10` | Connections in the world at once |
+| `JOINS_PER_ADDRESS` | `20/60` | New joining connections: 20 at once, then one more every 3 seconds (20 per 60) |
+| `PINGS_PER_ADDRESS` | `120/60` | Server list pings, the same way: 120 at once, then two a second |
+
+`0` turns a limit off. An address is an IPv4 address, or for IPv6 the /64 it
+is in, because one customer usually holds a whole /64. A player over a limit
+is turned away at login with a message saying why; a ping over its limit gets
+no answer, so the server shows as unreachable in that player's list. Several
+players behind one address (a household, a school, a LAN party) are normal,
+which is why the defaults are not lower.
+
+The Worker passes the world a hash of the address, not the address, and the
+world keeps those hashes in memory only: a restart forgets them. Neither
+stores, logs nor reports an address. A connection whose address is unknown is
+not limited.
 
 ## Offline mode and skins
 
@@ -288,6 +317,10 @@ machine.
 Both read `INSTANCE`, or `HOST` and `PORT`, to find the server
 ([More than one server](#more-than-one-server)).
 
+`npm run test:limits` checks the [limits per address](#limits-per-address). It
+needs a server started with low limits, so it can reach them; the command is
+at the top of `test/limits.mjs`. It takes about a minute.
+
 ## Other game versions
 
 ```sh
@@ -314,6 +347,7 @@ shows as air and is kept in storage.
 | `src/index.ts` | The Worker: handshake, server list ping, pipe to the world |
 | `src/world/world.ts` | The Durable Object: players, movement, chat, blocks |
 | `src/world/session.ts` | One connection: protocol phases and packet parsing |
+| `src/world/limits.ts`, `src/net/address.ts` | Limits per client address |
 | `src/world/chunks.ts` | Block storage and the chunk packet |
 | `src/world/blockstates.ts` | Block state ids to properties and back |
 | `src/world/building.ts` | Placement rules, neighbour reactions, right-clicks, signs |
@@ -327,6 +361,7 @@ shows as air and is kept in storage.
 | `scripts/dev.mjs` | `npm run dev`: the world and its plugins in one `wrangler dev` |
 | `test/conformance/` | The conformance test, judged by Mojang's packet code |
 | `test/e2e.mjs` | The bot suite (26.1 build only) |
+| `test/limits.mjs` | The test of the limits per address |
 
 ## License
 
