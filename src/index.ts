@@ -99,8 +99,15 @@ export default {
 			const writer = upstream.writable.getWriter();
 			await writer.write(concat(received));
 			writer.releaseLock();
+			// The world ends the conversation: the client's connection is closed once
+			// everything the world sent has been passed on. The other direction is
+			// not waited for, because it fails as soon as the world stops reading,
+			// which is what it does to turn a player away, and closing on that
+			// could lose the reason it had just sent. When the client hangs up
+			// first, the world sees that and ends its side.
+			socket.readable.pipeTo(upstream.writable).catch(() => {});
 			try {
-				await Promise.all([socket.readable.pipeTo(upstream.writable), upstream.readable.pipeTo(socket.writable)]);
+				await upstream.readable.pipeTo(socket.writable);
 			} finally {
 				await Promise.allSettled([upstream.close()]);
 			}
