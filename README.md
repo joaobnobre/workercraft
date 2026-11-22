@@ -51,7 +51,14 @@ Works, and covered by the tests:
 - Blocks placed the way the game places them: logs along the clicked face,
   stairs and slabs by where the click landed, torches and signs on walls,
   doors and beds as two blocks, fences, panes, walls and stairs joining up
-- Torches, flowers and the like falling off when their block is broken
+- What a block may be put on, by the game's own rule for each kind of block
+  (torches, lanterns, signs, banners, buttons, levers, ladders, rails,
+  pressure plates, carpets, doors, redstone, plants, sugar cane, cactus,
+  vines, bells and more): a torch stands on a fence post but not on its side,
+  a flower grows on grass but not on stone. A refused block is taken back on
+  the player's screen. The same rule makes blocks fall off when what holds
+  them is broken or changes, such as a torch on a trapdoor that opens
+  ([What holds a block](#what-holds-a-block))
 - Doors, trapdoors, fence gates, levers and buttons, with their sounds
 - Signs: the editor opens, the text is stored and shown to everyone. Dyes,
   glow ink and honeycomb work on them
@@ -80,8 +87,7 @@ Not there:
 - Water and lava can be placed but do not flow, and an empty bucket does not
   pick them up.
 - Levers and buttons move and click but power nothing.
-- What a block may be attached to is not checked when it is placed, so a
-  torch can be put on a fence post or a pane. Double chests do not join.
+- Double chests do not join.
 - An item keeps only its type and count, so enchantments and names are lost.
   Items on the ground are not saved.
 
@@ -90,10 +96,35 @@ deployed 26.3 server at once, joining, chatting and building with a plugin
 command. Placing blocks, signs and doors were tried by hand on the 26.1 build;
 on 26.3 they are covered by the conformance test, which proves the game can
 read what the server sends, not that it then does the right thing with it.
-Transfers, cookies and the queue's line above the hotbar have not been tried
-with the real game at all: whether it follows the transfer, takes the cookie
-along and shows the line is up to the game, and only the conformance test's
-client has done so.
+What a block may be put on is checked there against the game's own rule;
+whether a refused block leaves anything behind on a real game's screen has
+not been tried. Transfers, cookies and the queue's line above the hotbar have
+not been tried with the real game at all: whether it follows the transfer,
+takes the cookie along and shows the line is up to the game, and only the
+conformance test's client has done so.
+
+### What holds a block
+
+Whether a block can stay where it is (vanilla's `canSurvive`) decides both
+whether it may be placed and whether it falls off later, so the two agree.
+Which faces of a block state can hold something (a full face, the centre for
+a torch, a rigid top for a rail) comes from the game itself through
+`npm run gen`; the rules, one per game class, are in
+`src/world/survival.ts`. Blocks that can hang on several sides (torches,
+signs, buttons, lanterns, ladders, vines) try them in the game's order,
+nearest to where the player looks first. Simplified:
+
+- There is no light, so mushrooms are taken to be in the dark and crops in
+  the light, wherever they are.
+- Water does not flow. Sugar cane, seagrass, kelp and spore blossoms look at
+  the water that is there, which is only ever what was placed.
+- Fire, farmland, dirt paths, scaffolding, bubble columns and piston heads
+  have rules about things the server does not do, and stay anywhere. Rails
+  are never sloped and pointed dripstone does not grow thicker.
+- A block checks again whenever anything next to it changes. The game checks
+  some only when the side that holds them changes, which matters only for a
+  block saved somewhere it could not have been put: it stays until something
+  next to it changes.
 
 ## Run it
 
@@ -351,6 +382,7 @@ shows as air and is kept in storage.
 | `src/world/chunks.ts` | Block storage and the chunk packet |
 | `src/world/blockstates.ts` | Block state ids to properties and back |
 | `src/world/building.ts` | Placement rules, neighbour reactions, right-clicks, signs |
+| `src/world/survival.ts` | What a block can rest on or hang from |
 | `src/world/items.ts` | Physics of dropped items |
 | `src/world/skins.ts` | Offline UUIDs and the skin lookup |
 | `src/protocol/` | Packet builders and the version data |
