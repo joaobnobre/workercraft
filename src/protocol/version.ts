@@ -41,6 +41,10 @@ interface VersionData {
 	itemBlocks: Record<string, number>;
 	itemNames: Record<string, string>;
 	stackSizes: Record<string, number>;
+	/** Item data component types without the namespace, indexed by protocol id. */
+	componentTypes: string[];
+	/** Entries in the built-in registries that item components refer to by id. */
+	builtinRegistrySizes: Record<string, number>;
 	entityTypes: { player: number; item: number };
 }
 
@@ -214,4 +218,20 @@ export function itemId(name: string): number | undefined {
 
 export function soundId(name: string): number | undefined {
 	return data.sounds[name];
+}
+
+const componentIds = new Map<string, number>(data.componentTypes.map((name, id) => [name, id]));
+
+/** An item data component type by name without the namespace, such as "custom_name". */
+export function componentId(name: string): number | undefined {
+	return componentIds.get(name);
+}
+
+export function componentName(id: number): string | undefined {
+	return data.componentTypes[id];
+}
+
+/** How many entries a registry has, built-in or synced. 0 for one this version does not have. */
+export function registrySize(registry: string): number {
+	return data.builtinRegistrySizes[registry] ?? data.registries.find(([name]) => name === registry)?.[1].length ?? 0;
 }

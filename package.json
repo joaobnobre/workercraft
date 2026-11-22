@@ -16,7 +16,8 @@
     "test": "node test/conformance.mjs",
     "test:queue": "node test/conformance.mjs --queue",
     "test:bots": "node test/e2e.mjs",
-    "test:limits": "node test/limits.mjs"
+    "test:limits": "node test/limits.mjs",
+    "test:restart": "node test/restart.mjs"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261121.1",

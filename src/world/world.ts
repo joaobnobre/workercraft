@@ -4,11 +4,12 @@
 
 import { DurableObject, RpcTarget } from "cloudflare:workers";
 import { keyFromTarget } from "../net/address";
-import { bytesToUuid, concat } from "../net/bytes";
+import { bytesToUuid, concat, uuidToBytes } from "../net/bytes";
 import type { Text } from "../net/nbt";
 import type { PlayerInfo, Server } from "../plugins/api";
 import { SPAWN, builtin } from "../plugins/builtin";
 import { PluginHost } from "../plugins/host";
+import { loadComponents, portable, sameKind, saveComponents, shownAs, type Stack } from "../protocol/components";
 import * as out from "../protocol/packets";
 import { AIR, BEFORE_26_3, blockState, data, itemId, itemName, soundId, stackSize } from "../protocol/version";
 import { DIRECTIONS, OFFSET, blockOf, type Direction } from "./blockstates";
@@ -68,8 +69,12 @@ export interface Player {
 	/** What is in each inventory slot. 9 to 35 is the backpack, 36 to 44 the hotbar, 45 the off hand. */
 	inventory: Map<number, out.Stack>;
 	heldSlot: number;
-	/** The item other players currently see in each equipment slot. */
-	shown: Map<number, number | undefined>;
+	/** What other players currently see in each equipment slot (see shownAs). */
+	shown: Map<number, string>;
+	/** Something in the player's hands or armour changed; others are told on the next tick. */
+	equipmentChanged: boolean;
+	/** Recent drops from the creative inventory, which are limited as on a vanilla server. */
+	creativeDrops: number;
 	/** The sign whose editor the server opened for this player. */
 	editingSign?: Position & { front: boolean };
 	lastKeepAlive: number;
@@ -111,6 +116,15 @@ const PICKUP_SLOTS = [36, 37, 38, 39, 40, 41, 42, 43, 44, ...Array.from({ length
 const CREATIVE_DROP_SLOT = -1;
 /** The oldest items disappear once this many lie around. */
 const MAX_DROPPED_ITEMS = 256;
+/** Vanilla's limit on drops from the creative inventory: each costs 20, one is forgiven per tick, past 1480 none. */
+const CREATIVE_DROP_COST = 20;
+const CREATIVE_DROP_LIMIT = 1480;
+/**
+ * Changes to dropped items are written to storage at most this often while
+ * players are online, and all of them when the last one leaves. A crash loses
+ * at most this much of their movement and ageing.
+ */
+const ITEM_SAVE_TICKS = 30 * 20;
 const EYE_HEIGHT = 1.62;
 const NOON = 6000;
 const CHAT_BURST = 5;
@@ -124,6 +138,10 @@ export class World extends DurableObject<Env> {
 	private logins = new Map<string, Session>();
 	private timerCount = 0;
 	private items = new Map<number, DroppedItem>();
+	/** Dropped items changed since they were last saved, by UUID; undefined for one that is gone. */
+	private unsavedItems = new Map<string, DroppedItem | undefined>();
+	/** How old each dropped item was when it was last written to storage. */
+	private savedAges = new WeakMap<DroppedItem, number>();
 	private blocks: BlockStore;
 	private skins: SkinCache;
 	private plugins: PluginHost;
@@ -146,6 +164,8 @@ export class World extends DurableObject<Env> {
 		this.skins = new SkinCache(sql);
 		sql.exec("CREATE TABLE IF NOT EXISTS players (name TEXT PRIMARY KEY, x REAL, y REAL, z REAL, yaw REAL, pitch REAL)");
 		sql.exec("CREATE TABLE IF NOT EXISTS inventories (name TEXT PRIMARY KEY, held INTEGER NOT NULL, slots TEXT NOT NULL)");
+		sql.exec("CREATE TABLE IF NOT EXISTS dropped_items (uuid TEXT PRIMARY KEY, data TEXT NOT NULL)");
+		this.loadItems();
 		this.maxPlayers = Number(env.MAX_PLAYERS) || 100;
 		this.maxViewDistance = Math.min(Math.max(Number(env.VIEW_DISTANCE) || 8, 2), 32);
 		this.limits = new AddressLimits(env);
@@ -242,12 +262,14 @@ export class World extends DurableObject<Env> {
 			inventory: new Map(),
 			heldSlot: 0,
 			shown: new Map(),
+			equipmentChanged: false,
+			creativeDrops: 0,
 			lastKeepAlive: Date.now(),
 			chatAllowance: CHAT_BURST,
 			chatAllowanceAt: Date.now(),
 		};
 		this.loadInventory(player);
-		for (const [slot, stack] of this.equipmentOf(player)) player.shown.set(slot, stack?.item);
+		for (const [slot, stack] of this.equipmentOf(player)) player.shown.set(slot, shownAs(stack));
 		session.player = player;
 		const others = [...this.players.values()];
 		this.players.set(key, player);
@@ -266,7 +288,7 @@ export class World extends DurableObject<Env> {
 				out.freezeTime(NOON),
 				out.tabList({ text: "workercraft", color: "gold", bold: true }, { text: "No server. One Durable Object.", color: "gray" }),
 				out.setHeldSlot(player.heldSlot),
-				...[...player.inventory].map(([slot, stack]) => out.setInventorySlot(slot, stack.item, stack.count)),
+				...[...player.inventory].map(([slot, stack]) => out.setInventorySlot(slot, stack)),
 				out.startWaitingForChunks(),
 			]),
 		);
@@ -311,6 +333,7 @@ export class World extends DurableObject<Env> {
 			// Nothing ticks from here on, so whatever was waiting happens now.
 			for (const { run } of this.scheduled.splice(0)) run();
 			this.blocks.flush();
+			this.saveItems(true);
 		}
 		void this.plugins.notify("onQuit", { player: info(player) });
 	}
@@ -324,6 +347,11 @@ export class World extends DurableObject<Env> {
 			for (const { run } of due) run();
 		}
 		this.tickItems();
+		if (this.tickCount % ITEM_SAVE_TICKS === 0) this.saveItems(false);
+		for (const player of this.players.values()) {
+			if (player.equipmentChanged) this.sendEquipment(player);
+			if (player.creativeDrops > 0) player.creativeDrops--;
+		}
 		if (this.tickCount % TIMER_TICKS === 0) void this.plugins.timer({ count: this.timerCount++ });
 		for (const player of this.players.values()) player.session.flush();
 		const now = Date.now();
@@ -340,7 +368,10 @@ export class World extends DurableObject<Env> {
 	private tickItems(): void {
 		const solid = (x: number, y: number, z: number) => this.blocks.getBlock(x, y, z) !== AIR;
 		for (const item of this.items.values()) {
-			if (stepItem(item, solid)) this.broadcastSoon(out.itemPosition(item, true));
+			if (stepItem(item, solid)) {
+				this.broadcastSoon(out.itemPosition(item, true));
+				this.itemChanged(item);
+			}
 			if (item.age > ITEM_LIFETIME_TICKS || item.y < MIN_Y - 64) this.removeItem(item);
 			else if (item.pickupDelay === 0) this.pickUp(item);
 		}
@@ -348,16 +379,22 @@ export class World extends DurableObject<Env> {
 
 	private removeItem(item: DroppedItem): void {
 		this.items.delete(item.entityId);
+		this.itemChanged(item, true);
 		this.broadcast(out.removeEntities([item.entityId]));
 	}
 
-	/** Throws an item out of the player's hands, the way pressing Q does. */
-	dropItem(player: Player, item: number, count: number): void {
+	/**
+	 * Throws an item out of the player's hands, the way pressing Q does. Only
+	 * checked components go with it (see protocol/components.ts): everyone sees
+	 * it, and whoever picks it up gets it.
+	 */
+	dropItem(player: Player, stack: Stack): void {
 		const dropped: DroppedItem = {
 			entityId: this.nextEntityId++,
 			uuid: crypto.getRandomValues(new Uint8Array(16)),
-			item,
-			count,
+			item: stack.item,
+			count: stack.count,
+			components: portable(stack.components),
 			x: player.x,
 			y: player.y + EYE_HEIGHT - 0.3,
 			z: player.z,
@@ -367,46 +404,135 @@ export class World extends DurableObject<Env> {
 			resting: false,
 		};
 		this.items.set(dropped.entityId, dropped);
+		this.itemChanged(dropped);
 		if (this.items.size > MAX_DROPPED_ITEMS) this.removeItem(this.items.values().next().value!);
 		this.broadcast(out.addItemEntity(dropped));
+	}
+
+	private itemChanged(item: DroppedItem, gone = false): void {
+		this.unsavedItems.set(bytesToUuid(item.uuid), gone ? undefined : item);
+	}
+
+	/**
+	 * Writes the dropped items that changed to storage, in one transaction,
+	 * each as it is at that moment. With `all`, also those that aged
+	 * noticeably since they were last written.
+	 */
+	private saveItems(all: boolean): void {
+		if (all) {
+			for (const item of this.items.values()) {
+				if (item.age - (this.savedAges.get(item) ?? -Infinity) >= ITEM_SAVE_TICKS) this.itemChanged(item);
+			}
+		}
+		if (this.unsavedItems.size === 0) return;
+		const pending = [...this.unsavedItems];
+		this.unsavedItems.clear();
+		const sql = this.ctx.storage.sql;
+		this.ctx.storage.transactionSync(() => {
+			for (const [uuid, item] of pending) {
+				const name = item && itemName(item.item);
+				if (!item || name === undefined) {
+					sql.exec("DELETE FROM dropped_items WHERE uuid = ?", uuid);
+					continue;
+				}
+				const { count, x, y, z, vx, vy, vz, age, pickupDelay, resting } = item;
+				const saved = { item: name, count, components: saveComponents(item.components), x, y, z, vx, vy, vz, age, pickupDelay, resting };
+				sql.exec("INSERT OR REPLACE INTO dropped_items (uuid, data) VALUES (?, ?)", uuid, JSON.stringify(saved));
+				this.savedAges.set(item, age);
+			}
+		});
+	}
+
+	/**
+	 * Puts back the dropped items the world had when it last went idle. A row
+	 * that does not make an item in this game version stays in storage, like a
+	 * block the version does not have.
+	 */
+	private loadItems(): void {
+		const loaded: DroppedItem[] = [];
+		const stale: string[] = [];
+		for (const row of this.ctx.storage.sql.exec<{ uuid: string; data: string }>("SELECT uuid, data FROM dropped_items")) {
+			try {
+				const saved = JSON.parse(row.data);
+				const item = itemId(String(saved.item));
+				if (item === undefined) continue; // another version's item: kept
+				const numbers = [saved.count, saved.x, saved.y, saved.z, saved.vx, saved.vy, saved.vz, saved.age, saved.pickupDelay];
+				const count = Math.min(Math.floor(saved.count), stackSize(item));
+				if (!numbers.every(Number.isFinite) || !/^[0-9a-f]{32}$/.test(row.uuid) || count <= 0 || saved.age > ITEM_LIFETIME_TICKS) {
+					stale.push(row.uuid);
+					continue;
+				}
+				loaded.push({
+					entityId: 0,
+					uuid: uuidToBytes(row.uuid),
+					item,
+					count,
+					components: loadComponents(saved.components),
+					x: saved.x,
+					y: saved.y,
+					z: saved.z,
+					vx: saved.vx,
+					vy: saved.vy,
+					vz: saved.vz,
+					age: Math.max(0, Math.floor(saved.age)),
+					pickupDelay: Math.max(0, Math.floor(saved.pickupDelay)),
+					resting: saved.resting === true,
+				});
+			} catch {
+				stale.push(row.uuid); // does not parse
+			}
+		}
+		// Oldest first, which is the order in which the item limit removes them.
+		loaded.sort((a, b) => b.age - a.age);
+		for (const item of loaded.slice(0, -MAX_DROPPED_ITEMS)) stale.push(bytesToUuid(item.uuid));
+		for (const uuid of stale) this.unsavedItems.set(uuid, undefined); // deleted with the next save
+		for (const item of loaded.slice(-MAX_DROPPED_ITEMS)) {
+			item.entityId = this.nextEntityId++;
+			this.items.set(item.entityId, item);
+			this.savedAges.set(item, item.age);
+		}
 	}
 
 	private pickUp(item: DroppedItem): void {
 		for (const player of this.players.values()) {
 			if (!canPickUp(item, player)) continue;
-			const taken = this.give(player, item.item, item.count);
+			const taken = this.give(player, item);
 			if (taken === 0) continue; // inventory full
 			this.broadcast(out.takeItem(item.entityId, player.entityId, taken));
 			item.count -= taken;
 			if (item.count <= 0) this.removeItem(item);
-			else this.broadcast(out.itemEntityStack(item.entityId, item.item, item.count));
+			else {
+				this.itemChanged(item);
+				this.broadcast(out.itemEntityStack(item.entityId, item));
+			}
 			return;
 		}
 	}
 
 	/** Adds items to a player's inventory and returns how many fitted. */
-	private give(player: Player, item: number, count: number): number {
-		const max = stackSize(item);
-		let left = count;
-		// Top up stacks of the same item first, then use empty slots.
+	private give(player: Player, given: Stack): number {
+		const max = stackSize(given.item);
+		let left = given.count;
+		// Top up stacks of the same item with the same components first, then use empty slots.
 		for (const topUp of [true, false]) {
 			for (const slot of PICKUP_SLOTS) {
 				if (left === 0) break;
 				const stack = player.inventory.get(slot);
-				if (topUp ? stack?.item !== item || stack.count >= max : stack !== undefined) continue;
+				if (topUp ? !stack || !sameKind(stack, given) || stack.count >= max : stack !== undefined) continue;
 				const added = Math.min(left, max - (stack?.count ?? 0));
 				left -= added;
-				this.setSlot(player, slot, item, (stack?.count ?? 0) + added);
+				this.setSlot(player, slot, { item: given.item, count: (stack?.count ?? 0) + added, components: given.components });
 			}
 		}
-		return count - left;
+		return given.count - left;
 	}
 
 	/** Changes an inventory slot and tells the client. */
-	private setSlot(player: Player, slot: number, item: number, count: number): void {
-		if (count > 0) player.inventory.set(slot, { item, count });
+	private setSlot(player: Player, slot: number, stack: Stack | undefined): void {
+		const kept = stack && stack.count > 0 ? stack : undefined;
+		if (kept) player.inventory.set(slot, kept);
 		else player.inventory.delete(slot);
-		player.session.send(out.setInventorySlot(slot, item, count));
+		player.session.send(out.setInventorySlot(slot, kept));
 		this.syncEquipment(player);
 	}
 
@@ -418,11 +544,20 @@ export class World extends DurableObject<Env> {
 		];
 	}
 
-	/** Shows other players whatever changed in the player's hands or armour. */
+	/**
+	 * Shows other players, on the next tick, whatever changed in the player's
+	 * hands or armour, components included. Once a tick at most, so that
+	 * scrolling through the hotbar cannot flood everyone with large stacks.
+	 */
 	private syncEquipment(player: Player): void {
-		const changed = this.equipmentOf(player).filter(([slot, stack]) => player.shown.get(slot) !== stack?.item);
+		player.equipmentChanged = true;
+	}
+
+	private sendEquipment(player: Player): void {
+		player.equipmentChanged = false;
+		const changed = this.equipmentOf(player).filter(([slot, stack]) => player.shown.get(slot) !== shownAs(stack));
 		if (changed.length === 0) return;
-		for (const [slot, stack] of changed) player.shown.set(slot, stack?.item);
+		for (const [slot, stack] of changed) player.shown.set(slot, shownAs(stack));
 		this.broadcast(out.setEquipment(player.entityId, changed), player);
 	}
 
@@ -431,11 +566,16 @@ export class World extends DurableObject<Env> {
 		this.syncEquipment(player);
 	}
 
-	/** Items are stored by name, so a saved inventory survives a change of game version. */
+	/**
+	 * Items are stored by name, so a saved inventory survives a change of game
+	 * version. Their checked components are stored too, and only come back
+	 * under the same version (see protocol/components.ts).
+	 */
 	private saveInventory(player: Player): void {
 		const slots = [...player.inventory].flatMap(([slot, stack]) => {
 			const name = itemName(stack.item);
-			return name === undefined ? [] : [[slot, name, stack.count] as const];
+			const components = saveComponents(stack.components);
+			return name === undefined ? [] : [components ? [slot, name, stack.count, components] : [slot, name, stack.count]];
 		});
 		this.ctx.storage.sql.exec("INSERT OR REPLACE INTO inventories (name, held, slots) VALUES (?, ?, ?)", player.name.toLowerCase(), player.heldSlot, JSON.stringify(slots));
 	}
@@ -444,19 +584,22 @@ export class World extends DurableObject<Env> {
 		const saved = this.ctx.storage.sql.exec<{ held: number; slots: string }>("SELECT held, slots FROM inventories WHERE name = ?", player.name.toLowerCase()).toArray()[0];
 		if (!saved) return;
 		player.heldSlot = saved.held >= 0 && saved.held <= 8 ? saved.held : 0;
-		for (const [slot, name, count] of JSON.parse(saved.slots) as [number, string, number][]) {
+		for (const [slot, name, count, components] of JSON.parse(saved.slots) as [number, string, number, unknown?][]) {
 			const item = itemId(name);
-			if (item !== undefined) player.inventory.set(slot, { item, count });
+			if (item !== undefined && count > 0) player.inventory.set(slot, { item, count, components: loadComponents(components) });
 		}
 	}
 
 	/** The creative inventory screen telling the server what the player put where. */
-	creativeSlot(player: Player, slot: number, item: number, count: number): void {
-		const amount = Math.min(count, stackSize(item));
+	creativeSlot(player: Player, slot: number, stack: Stack | undefined): void {
+		const amount = stack ? Math.min(stack.count, stackSize(stack.item)) : 0;
+		const kept = stack && amount > 0 ? { ...stack, count: amount } : undefined;
 		if (slot === CREATIVE_DROP_SLOT) {
-			if (amount > 0) this.dropItem(player, item, amount);
+			if (!kept || player.creativeDrops >= CREATIVE_DROP_LIMIT) return;
+			player.creativeDrops += CREATIVE_DROP_COST;
+			this.dropItem(player, kept);
 		} else if (slot >= 0 && slot <= OFF_HAND_SLOT) {
-			if (amount > 0) player.inventory.set(slot, { item, count: amount });
+			if (kept) player.inventory.set(slot, kept);
 			else player.inventory.delete(slot);
 			this.syncEquipment(player);
 		}
@@ -474,9 +617,9 @@ export class World extends DurableObject<Env> {
 			else player.inventory.delete(OFF_HAND_SLOT);
 		} else if (held) {
 			const count = action === "dropStack" ? held.count : 1;
-			held.count -= count;
-			if (held.count <= 0) player.inventory.delete(heldSlot);
-			this.dropItem(player, held.item, count);
+			if (held.count - count <= 0) player.inventory.delete(heldSlot);
+			else player.inventory.set(heldSlot, { ...held, count: held.count - count });
+			this.dropItem(player, { ...held, count });
 		}
 		this.syncEquipment(player);
 	}
@@ -847,13 +990,14 @@ export class World extends DurableObject<Env> {
 		const item = state === AIR ? undefined : itemId(itemForBlock(blockOf(state)));
 		if (item === undefined) return;
 		const hotbar = Array.from({ length: 9 }, (_, slot) => player.inventory.get(HOTBAR_FIRST_SLOT + slot));
-		// Switch to the item if the hotbar has it. Otherwise put it in the hand, or
-		// in the first free hotbar slot when the hand is holding something else.
-		let slot = hotbar.findIndex((stack) => stack?.item === item);
+		// Switch to the item if the hotbar has it, as it comes from the block: a
+		// renamed or enchanted one is something else. Otherwise put it in the hand,
+		// or in the first free hotbar slot when the hand is holding something else.
+		let slot = hotbar.findIndex((stack) => stack?.item === item && !stack.components);
 		if (slot < 0) {
 			const free = hotbar.findIndex((stack) => stack === undefined);
 			slot = hotbar[player.heldSlot] === undefined || free < 0 ? player.heldSlot : free;
-			this.setSlot(player, HOTBAR_FIRST_SLOT + slot, item, 1);
+			this.setSlot(player, HOTBAR_FIRST_SLOT + slot, { item, count: 1 });
 		}
 		player.session.send(out.setHeldSlot(slot));
 		this.holdSlot(player, slot);

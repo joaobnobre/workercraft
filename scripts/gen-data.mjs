@@ -385,6 +385,14 @@ for (const [id, name] of Object.entries(itemNames)) {
 	if (typeof size === "number" && size !== 64) stackSizes[id] = size;
 }
 
+// Item data components by protocol id, and how many entries the built-in
+// registries that components refer to have (see protocol/components.ts).
+const componentTypes = [];
+for (const [name, { protocol_id }] of Object.entries(registriesReport["minecraft:data_component_type"].entries)) componentTypes[protocol_id] = strip(name);
+if (componentTypes.length < 50 || componentTypes.some((name) => name === undefined)) throw new Error("The data component types are not numbered 0 to n-1");
+const builtinRegistrySizes = {};
+for (const id of ["minecraft:item", "minecraft:potion", "minecraft:mob_effect"]) builtinRegistrySizes[id] = Object.keys(registriesReport[id].entries).length;
+
 const entityType = (name) => registriesReport["minecraft:entity_type"].entries[`minecraft:${name}`].protocol_id;
 
 const need = (table, key) => {
@@ -428,6 +436,8 @@ const out = {
 	itemBlocks,
 	itemNames,
 	stackSizes,
+	componentTypes,
+	builtinRegistrySizes,
 	entityTypes: { player: entityType("player"), item: entityType("item") },
 };
 const outFile = join(root, "src/generated", `v${versionInfo.protocol_version}.json`);
